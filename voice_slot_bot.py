@@ -1,15 +1,16 @@
 """
-Combined Shopify webhook listener + Discord bot for 3-hour voice channel slots.
+Combined Shopify webhook listener + Discord bot for token-based 3-hour
+voice channel booking slots.
 
 Flow:
-  1. Customer buys a "3-hour slot" product on Shopify.
-  2. Shopify sends an orders/create webhook -> this server generates a
-     redemption code and stores it in SQLite.
-  3. Customer runs /redeem <code> in Discord.
-  4. Bot validates the code, moves them into the target voice channel,
-     and starts their 3-hour timer.
-  5. A background loop checks every 30s and disconnects anyone who has
-     been in the channel longer than 3 hours.
+  1. Customer buys N "tokens" on Shopify (quantity = number of tokens).
+  2. Shopify sends an orders/create webhook -> this server generates one
+     redemption code per token and emails them to the customer.
+  3. Customer runs /redeem <code> in Discord -> adds 1 token to their balance.
+  4. Customer runs /book <date> <slot> to spend 1 token reserving a fixed
+     daily 3-hour window: 9-12, 12-3, or 3-6 (America/Toronto time).
+  5. A background loop creates a private voice channel automatically when
+     a booked slot starts, and deletes it automatically when it ends.
 
 Run:
   pip install discord.py flask python-dotenv
@@ -18,9 +19,11 @@ Run:
 Environment variables (put these in a .env file or your host's config):
   DISCORD_BOT_TOKEN     - bot token from the Discord Developer Portal
   SHOPIFY_WEBHOOK_SECRET- from Shopify Admin > Settings > Notifications > Webhooks
-  VOICE_CHANNEL_ID      - the Discord voice channel ID slots unlock access to
   GUILD_ID              - your Discord server (guild) ID
-  FLASK_PORT            - port for the webhook server (default 5000)
+  CATEGORY_ID           - (optional) category ID to create booking channels under
+  FLASK_PORT            - port for the webhook server (default 5000, ignored on Railway)
+  GMAIL_ADDRESS         - Gmail address to send redemption codes from
+  GMAIL_APP_PASSWORD    - 16-character Gmail App Password (not your normal password)
 """
 
 import os
@@ -31,7 +34,9 @@ import secrets
 import sqlite3
 import threading
 import datetime
-import asyncio
+import smtplib
+from email.mime.text import MIMEText
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -43,12 +48,24 @@ load_dotenv()
 
 DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 SHOPIFY_WEBHOOK_SECRET = os.environ["SHOPIFY_WEBHOOK_SECRET"]
-VOICE_CHANNEL_ID = int(os.environ["VOICE_CHANNEL_ID"])
 GUILD_ID = int(os.environ["GUILD_ID"])
+CATEGORY_ID = os.environ.get("CATEGORY_ID")
+CATEGORY_ID = int(CATEGORY_ID) if CATEGORY_ID else None
 FLASK_PORT = int(os.environ.get("FLASK_PORT", 5000))
+GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]
+GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 
-SLOT_DURATION = datetime.timedelta(hours=3)
+TZ = ZoneInfo("America/Toronto")
 DB_PATH = "slots.db"
+
+# Default daily slots, seeded into the DB on first run. After that, slots
+# live in the slot_definitions table and admins manage them with
+# /addslot, /removeslot, /listslots.
+DEFAULT_SLOTS = {
+    "9-12": (9, 12, "9am - 12pm"),
+    "12-3": (12, 15, "12pm - 3pm"),
+    "3-6": (15, 18, "3pm - 6pm"),
+}
 
 # ---------------------------------------------------------------------------
 # Database setup
@@ -67,11 +84,75 @@ def db_conn():
             created_at TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS balances (
+            discord_user_id TEXT PRIMARY KEY,
+            tokens INTEGER DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bookings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_user_id TEXT,
+            booking_date TEXT,
+            slot TEXT,
+            start_ts TEXT,
+            end_ts TEXT,
+            channel_id TEXT,
+            status TEXT DEFAULT 'booked'
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS slot_definitions (
+            slot_key TEXT PRIMARY KEY,
+            start_hour INTEGER,
+            end_hour INTEGER,
+            label TEXT
+        )
+    """)
     conn.commit()
+
+    existing = conn.execute("SELECT COUNT(*) FROM slot_definitions").fetchone()[0]
+    if existing == 0:
+        for key, (start_h, end_h, label) in DEFAULT_SLOTS.items():
+            conn.execute(
+                "INSERT INTO slot_definitions (slot_key, start_hour, end_hour, label) VALUES (?, ?, ?, ?)",
+                (key, start_h, end_h, label),
+            )
+        conn.commit()
+
     return conn
 
 db_lock = threading.Lock()
 conn = db_conn()
+
+# ---------------------------------------------------------------------------
+# Email
+# ---------------------------------------------------------------------------
+
+def send_codes_email(to_email, codes):
+    if len(codes) == 1:
+        body = (
+            f"Your code is: {codes[0]}\n\n"
+            f"Join our Discord and run /redeem {codes[0]} to add a token to your "
+            f"balance, then /book to reserve a 3-hour slot."
+        )
+    else:
+        code_lines = "\n".join(f"  {c}" for c in codes)
+        body = (
+            f"You purchased {len(codes)} tokens. Your codes are:\n\n{code_lines}\n\n"
+            f"Join our Discord and run /redeem <code> for each one to add them to "
+            f"your balance, then /book to reserve 3-hour slots."
+        )
+
+    msg = MIMEText(body)
+    msg["Subject"] = "Your voice channel tokens"
+    msg["From"] = GMAIL_ADDRESS
+    msg["To"] = to_email
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        server.sendmail(GMAIL_ADDRESS, to_email, msg.as_string())
 
 # ---------------------------------------------------------------------------
 # Flask webhook server (runs in its own thread)
@@ -96,24 +177,36 @@ def order_created():
     order_id = str(order.get("id"))
     email = order.get("email") or order.get("contact_email") or "unknown"
 
-    code = secrets.token_hex(4).upper()  # e.g. "A1B2C3D4"
+    # Total tokens purchased = sum of quantities across all line items.
+    # If your store sells other products too, filter this to only count
+    # line items matching your token product's ID/SKU instead.
+    line_items = order.get("line_items", [])
+    quantity = sum(item.get("quantity", 1) for item in line_items) or 1
 
+    codes = []
     with db_lock:
-        conn.execute(
-            "INSERT INTO codes (code, order_id, customer_email, created_at) VALUES (?, ?, ?, ?)",
-            (code, order_id, email, datetime.datetime.utcnow().isoformat()),
-        )
+        for _ in range(quantity):
+            code = secrets.token_hex(4).upper()
+            conn.execute(
+                "INSERT INTO codes (code, order_id, customer_email, created_at) VALUES (?, ?, ?, ?)",
+                (code, order_id, email, datetime.datetime.utcnow().isoformat()),
+            )
+            codes.append(code)
         conn.commit()
 
-    # TODO: send the code to the customer here (email API call, or rely on
-    # the Shopify order-confirmation email template to display it — see
-    # shopify_email_template.liquid). For now it's just stored in the DB.
-    print(f"[webhook] order {order_id} -> code {code} for {email}")
+    if email != "unknown":
+        try:
+            send_codes_email(email, codes)
+        except Exception as e:
+            print(f"[webhook] failed to email codes to {email}: {e}")
+
+    print(f"[webhook] order {order_id} -> codes {codes} for {email}")
 
     return "ok", 200
 
 def run_flask():
-    app.run(host="0.0.0.0", port=FLASK_PORT)
+    port = int(os.environ.get("PORT", FLASK_PORT))
+    app.run(host="0.0.0.0", port=port)
 
 # ---------------------------------------------------------------------------
 # Discord bot
@@ -130,26 +223,36 @@ class SlotBot(discord.Client):
 
     async def setup_hook(self):
         await self.tree.sync(guild=discord.Object(id=GUILD_ID))
-        check_expired_slots.start()
+        slot_scheduler.start()
 
 client = SlotBot()
 
-# user_id -> join_time (UTC)
-active_sessions: dict[int, datetime.datetime] = {}
+def get_balance(discord_user_id: str) -> int:
+    row = conn.execute(
+        "SELECT tokens FROM balances WHERE discord_user_id = ?", (discord_user_id,)
+    ).fetchone()
+    return row[0] if row else 0
+
+def get_slots() -> dict:
+    """Returns {slot_key: (start_hour, end_hour, label)} from the DB."""
+    rows = conn.execute("SELECT slot_key, start_hour, end_hour, label FROM slot_definitions").fetchall()
+    return {key: (start_h, end_h, label) for key, start_h, end_h, label in rows}
+
+def is_admin(interaction: discord.Interaction) -> bool:
+    return interaction.user.guild_permissions.administrator
 
 @client.tree.command(
     name="redeem",
-    description="Redeem your 3-hour voice channel slot code",
+    description="Redeem a purchased code to add a token to your balance",
     guild=discord.Object(id=GUILD_ID),
 )
-@app_commands.describe(code="The code from your order confirmation")
+@app_commands.describe(code="The code from your order confirmation email")
 async def redeem(interaction: discord.Interaction, code: str):
     code = code.strip().upper()
+    user_id = str(interaction.user.id)
 
     with db_lock:
-        row = conn.execute(
-            "SELECT used FROM codes WHERE code = ?", (code,)
-        ).fetchone()
+        row = conn.execute("SELECT used FROM codes WHERE code = ?", (code,)).fetchone()
 
         if row is None:
             await interaction.response.send_message("That code isn't valid.", ephemeral=True)
@@ -160,52 +263,326 @@ async def redeem(interaction: discord.Interaction, code: str):
 
         conn.execute(
             "UPDATE codes SET used = 1, redeemed_by = ?, redeemed_at = ? WHERE code = ?",
-            (str(interaction.user.id), datetime.datetime.utcnow().isoformat(), code),
+            (user_id, datetime.datetime.utcnow().isoformat(), code),
+        )
+        conn.execute(
+            "INSERT INTO balances (discord_user_id, tokens) VALUES (?, 1) "
+            "ON CONFLICT(discord_user_id) DO UPDATE SET tokens = tokens + 1",
+            (user_id,),
         )
         conn.commit()
-
-    guild = client.get_guild(GUILD_ID)
-    member = guild.get_member(interaction.user.id)
-    channel = guild.get_channel(VOICE_CHANNEL_ID)
-
-    if member is None or channel is None:
-        await interaction.response.send_message(
-            "Redeemed, but I couldn't find you or the channel. Contact an admin.", ephemeral=True
-        )
-        return
-
-    active_sessions[member.id] = datetime.datetime.utcnow()
-
-    if member.voice is not None:
-        await member.move_to(channel)
-    # If they're not already in a voice channel, Discord doesn't let bots
-    # pull them in from nothing — send them the channel link/invite instead.
+        new_balance = get_balance(user_id)
 
     await interaction.response.send_message(
-        f"Code redeemed! Join {channel.mention} — your 3-hour window starts now.",
+        f"Token added! You now have {new_balance} token(s). Use /book to reserve a slot.",
         ephemeral=True,
     )
 
-@client.event
-async def on_voice_state_update(member, before, after):
-    # Clear the session if they leave the slot channel on their own.
-    if before.channel and before.channel.id == VOICE_CHANNEL_ID:
-        if not after.channel or after.channel.id != VOICE_CHANNEL_ID:
-            active_sessions.pop(member.id, None)
+async def slot_autocomplete(interaction: discord.Interaction, current: str):
+    slots = get_slots()
+    choices = [
+        app_commands.Choice(name=label, value=key)
+        for key, (_, _, label) in slots.items()
+        if current.lower() in label.lower() or current.lower() in key.lower()
+    ]
+    return choices[:25]
 
-@tasks.loop(seconds=30)
-async def check_expired_slots():
-    now = datetime.datetime.utcnow()
+@client.tree.command(
+    name="book",
+    description="Book a slot using one of your tokens",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(
+    date="Date in YYYY-MM-DD format (Eastern time)",
+    slot="Which time slot (use /listslots to see options)",
+)
+@app_commands.autocomplete(slot=slot_autocomplete)
+async def book(interaction: discord.Interaction, date: str, slot: str):
+    user_id = str(interaction.user.id)
+    slot_key = slot
+
+    slots = get_slots()
+    if slot_key not in slots:
+        await interaction.response.send_message(
+            "That slot doesn't exist. Use /listslots to see current options.", ephemeral=True
+        )
+        return
+
+    try:
+        booking_date = datetime.datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        await interaction.response.send_message(
+            "Invalid date format. Use YYYY-MM-DD, e.g. 2026-07-15.", ephemeral=True
+        )
+        return
+
+    start_hour, end_hour, label = slots[slot_key]
+    start_dt = datetime.datetime.combine(booking_date, datetime.time(hour=start_hour), tzinfo=TZ)
+    end_dt = datetime.datetime.combine(booking_date, datetime.time(hour=end_hour), tzinfo=TZ)
+    now = datetime.datetime.now(TZ)
+
+    if start_dt <= now:
+        await interaction.response.send_message(
+            "That slot is in the past or already started. Pick a future date/slot.", ephemeral=True
+        )
+        return
+
+    with db_lock:
+        balance = get_balance(user_id)
+        if balance < 1:
+            await interaction.response.send_message(
+                "You don't have any tokens. Redeem a code first with /redeem.", ephemeral=True
+            )
+            return
+
+        # Prevent the same user double-booking the identical slot.
+        dupe = conn.execute(
+            "SELECT id FROM bookings WHERE discord_user_id = ? AND booking_date = ? AND slot = ? AND status != 'cancelled'",
+            (user_id, date, slot_key),
+        ).fetchone()
+        if dupe:
+            await interaction.response.send_message(
+                "You've already booked that exact slot.", ephemeral=True
+            )
+            return
+
+        conn.execute(
+            "UPDATE balances SET tokens = tokens - 1 WHERE discord_user_id = ?", (user_id,)
+        )
+        conn.execute(
+            "INSERT INTO bookings (discord_user_id, booking_date, slot, start_ts, end_ts, status) "
+            "VALUES (?, ?, ?, ?, ?, 'booked')",
+            (user_id, date, slot_key, start_dt.isoformat(), end_dt.isoformat()),
+        )
+        conn.commit()
+
+    await interaction.response.send_message(
+        f"Booked! {date} {label} (Eastern). Your private voice channel will appear "
+        f"automatically when the slot starts, and close automatically when it ends.",
+        ephemeral=True,
+    )
+
+@client.tree.command(
+    name="listslots",
+    description="Show the current bookable time slots",
+    guild=discord.Object(id=GUILD_ID),
+)
+async def listslots(interaction: discord.Interaction):
+    slots = get_slots()
+    if not slots:
+        await interaction.response.send_message("No slots are configured.", ephemeral=True)
+        return
+    text = "\n".join(f"  {key} — {label}" for key, (_, _, label) in sorted(slots.items()))
+    await interaction.response.send_message(f"Current slots:\n{text}", ephemeral=True)
+
+@client.tree.command(
+    name="addslot",
+    description="[Admin] Add or update a bookable time slot",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(
+    key="Short identifier, e.g. '9-12'",
+    start_hour="Start hour, 24h format, e.g. 9",
+    end_hour="End hour, 24h format, e.g. 12",
+    label="Display label, e.g. '9am - 12pm'",
+)
+async def addslot(interaction: discord.Interaction, key: str, start_hour: int, end_hour: int, label: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    if not (0 <= start_hour < 24 and 0 < end_hour <= 24 and start_hour < end_hour):
+        await interaction.response.send_message("Hours must be 0-24 and start before end.", ephemeral=True)
+        return
+
+    with db_lock:
+        conn.execute(
+            "INSERT INTO slot_definitions (slot_key, start_hour, end_hour, label) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(slot_key) DO UPDATE SET start_hour = ?, end_hour = ?, label = ?",
+            (key, start_hour, end_hour, label, start_hour, end_hour, label),
+        )
+        conn.commit()
+
+    await interaction.response.send_message(f"Slot '{key}' set to {label}.", ephemeral=True)
+
+@client.tree.command(
+    name="removeslot",
+    description="[Admin] Remove a bookable time slot",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(key="The slot identifier to remove, e.g. '9-12'")
+async def removeslot(interaction: discord.Interaction, key: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+
+    with db_lock:
+        cur = conn.execute("DELETE FROM slot_definitions WHERE slot_key = ?", (key,))
+        conn.commit()
+
+    if cur.rowcount == 0:
+        await interaction.response.send_message(f"No slot found with key '{key}'.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Slot '{key}' removed.", ephemeral=True)
+
+@client.tree.command(
+    name="addbalance",
+    description="[Admin] Increase a user's token balance",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(user="The user to credit", amount="How many tokens to add")
+async def addbalance(interaction: discord.Interaction, user: discord.Member, amount: int):
+    if not is_admin(interaction):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    if amount <= 0:
+        await interaction.response.send_message("Amount must be positive.", ephemeral=True)
+        return
+
+    user_id = str(user.id)
+    with db_lock:
+        conn.execute(
+            "INSERT INTO balances (discord_user_id, tokens) VALUES (?, ?) "
+            "ON CONFLICT(discord_user_id) DO UPDATE SET tokens = tokens + ?",
+            (user_id, amount, amount),
+        )
+        conn.commit()
+        new_balance = get_balance(user_id)
+
+    await interaction.response.send_message(
+        f"Added {amount} token(s) to {user.mention}. New balance: {new_balance}.", ephemeral=True
+    )
+
+@client.tree.command(
+    name="removebalance",
+    description="[Admin] Decrease a user's token balance",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(user="The user to debit", amount="How many tokens to remove")
+async def removebalance(interaction: discord.Interaction, user: discord.Member, amount: int):
+    if not is_admin(interaction):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    if amount <= 0:
+        await interaction.response.send_message("Amount must be positive.", ephemeral=True)
+        return
+
+    user_id = str(user.id)
+    with db_lock:
+        current = get_balance(user_id)
+        new_amount = max(0, current - amount)
+        conn.execute(
+            "INSERT INTO balances (discord_user_id, tokens) VALUES (?, ?) "
+            "ON CONFLICT(discord_user_id) DO UPDATE SET tokens = ?",
+            (user_id, new_amount, new_amount),
+        )
+        conn.commit()
+
+    await interaction.response.send_message(
+        f"Removed {amount} token(s) from {user.mention}. New balance: {new_amount}.", ephemeral=True
+    )
+
+@client.tree.command(
+    name="mybookings",
+    description="Show your upcoming bookings and token balance",
+    guild=discord.Object(id=GUILD_ID),
+)
+async def mybookings(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    balance = get_balance(user_id)
+
+    rows = conn.execute(
+        "SELECT booking_date, slot, status FROM bookings WHERE discord_user_id = ? "
+        "AND status != 'cancelled' ORDER BY booking_date, slot",
+        (user_id,),
+    ).fetchall()
+
+    if not rows:
+        booking_text = "No upcoming bookings."
+    else:
+        booking_text = "\n".join(f"  {d} — {s} ({st})" for d, s, st in rows)
+
+    await interaction.response.send_message(
+        f"Token balance: {balance}\n\nBookings:\n{booking_text}", ephemeral=True
+    )
+
+# ---------------------------------------------------------------------------
+# Scheduler: create channels when slots start, delete when they end
+# ---------------------------------------------------------------------------
+
+@tasks.loop(seconds=60)
+async def slot_scheduler():
     guild = client.get_guild(GUILD_ID)
     if guild is None:
         return
 
-    for user_id, joined in list(active_sessions.items()):
-        if now - joined > SLOT_DURATION:
-            member = guild.get_member(user_id)
-            if member and member.voice and member.voice.channel and member.voice.channel.id == VOICE_CHANNEL_ID:
-                await member.move_to(None)  # disconnects them from voice
-            active_sessions.pop(user_id, None)
+    now = datetime.datetime.now(TZ)
+
+    # Start slots that have just begun and don't have a channel yet.
+    to_start = conn.execute(
+        "SELECT id, discord_user_id, start_ts, end_ts FROM bookings "
+        "WHERE status = 'booked' AND channel_id IS NULL"
+    ).fetchall()
+
+    for booking_id, user_id, start_ts, end_ts in to_start:
+        start_dt = datetime.datetime.fromisoformat(start_ts)
+        if start_dt <= now:
+            member = guild.get_member(int(user_id))
+            if member is None:
+                continue
+
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
+                member: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True),
+                guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True),
+            }
+            category = guild.get_channel(CATEGORY_ID) if CATEGORY_ID else None
+
+            channel = await guild.create_voice_channel(
+                name=f"slot-{member.display_name}"[:32],
+                overwrites=overwrites,
+                category=category,
+            )
+
+            with db_lock:
+                conn.execute(
+                    "UPDATE bookings SET channel_id = ? WHERE id = ?",
+                    (str(channel.id), booking_id),
+                )
+                conn.commit()
+
+            try:
+                await member.send(
+                    f"Your slot has started! Join your private channel: {channel.mention}"
+                )
+            except discord.Forbidden:
+                pass  # user has DMs disabled
+
+    # End slots that are over: delete the channel, mark completed.
+    to_end = conn.execute(
+        "SELECT id, channel_id, end_ts FROM bookings "
+        "WHERE status = 'booked' AND channel_id IS NOT NULL"
+    ).fetchall()
+
+    for booking_id, channel_id, end_ts in to_end:
+        end_dt = datetime.datetime.fromisoformat(end_ts)
+        if end_dt <= now:
+            channel = guild.get_channel(int(channel_id))
+            if channel is not None:
+                for member in list(channel.members):
+                    try:
+                        await member.move_to(None)
+                    except discord.HTTPException:
+                        pass
+                try:
+                    await channel.delete(reason="Slot time expired")
+                except discord.HTTPException:
+                    pass
+
+            with db_lock:
+                conn.execute(
+                    "UPDATE bookings SET status = 'completed' WHERE id = ?", (booking_id,)
+                )
+                conn.commit()
 
 # ---------------------------------------------------------------------------
 # Entrypoint: run Flask in a background thread, Discord bot in the main loop
