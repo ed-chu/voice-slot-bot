@@ -1,0 +1,4 @@
+venv/
+.env
+slots.db
+__pycache__/
