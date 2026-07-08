@@ -78,12 +78,19 @@ def db_conn():
             code TEXT PRIMARY KEY,
             order_id TEXT,
             customer_email TEXT,
+            token_value INTEGER DEFAULT 1,
             used INTEGER DEFAULT 0,
             redeemed_by TEXT,
             redeemed_at TEXT,
             created_at TEXT
         )
     """)
+    # Migration: add token_value to any pre-existing codes table that
+    # predates this column.
+    existing_cols = [row[1] for row in conn.execute("PRAGMA table_info(codes)").fetchall()]
+    if "token_value" not in existing_cols:
+        conn.execute("ALTER TABLE codes ADD COLUMN token_value INTEGER DEFAULT 1")
+        conn.commit()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS balances (
             discord_user_id TEXT PRIMARY KEY,
@@ -131,18 +138,22 @@ conn = db_conn()
 # ---------------------------------------------------------------------------
 
 def send_codes_email(to_email, codes):
+    # codes is a list of (code, value) tuples
+    total_tokens = sum(value for _, value in codes)
+
     if len(codes) == 1:
+        code, value = codes[0]
         body = (
-            f"Your code is: {codes[0]}\n\n"
-            f"Join our Discord and run /redeem {codes[0]} to add a token to your "
-            f"balance, then /book to reserve a 3-hour slot."
+            f"Your code is: {code} (worth {value} token{'s' if value != 1 else ''})\n\n"
+            f"Join our Discord and run /redeem {code} to add {value} token(s) to your "
+            f"balance, then /book to reserve a slot."
         )
     else:
-        code_lines = "\n".join(f"  {c}" for c in codes)
+        code_lines = "\n".join(f"  {c} — {v} token{'s' if v != 1 else ''}" for c, v in codes)
         body = (
-            f"You purchased {len(codes)} tokens. Your codes are:\n\n{code_lines}\n\n"
+            f"You purchased {total_tokens} token(s) total. Your codes are:\n\n{code_lines}\n\n"
             f"Join our Discord and run /redeem <code> for each one to add them to "
-            f"your balance, then /book to reserve 3-hour slots."
+            f"your balance, then /book to reserve slots."
         )
 
     msg = MIMEText(body)
@@ -177,21 +188,23 @@ def order_created():
     order_id = str(order.get("id"))
     email = order.get("email") or order.get("contact_email") or "unknown"
 
-    # Total tokens purchased = sum of quantities across all line items.
-    # If your store sells other products too, filter this to only count
-    # line items matching your token product's ID/SKU instead.
-    line_items = order.get("line_items", [])
-    quantity = sum(item.get("quantity", 1) for item in line_items) or 1
+    # One code per line item, worth that item's quantity in tokens. So
+    # buying quantity 5 of the token product produces a single code worth
+    # 5 tokens, rather than 5 separate 1-token codes. If your store sells
+    # other products too, filter this to only include line items matching
+    # your token product's ID/SKU.
+    line_items = order.get("line_items", []) or [{"quantity": 1}]
 
-    codes = []
+    codes = []  # list of (code, value) tuples
     with db_lock:
-        for _ in range(quantity):
+        for item in line_items:
+            value = item.get("quantity", 1)
             code = secrets.token_hex(4).upper()
             conn.execute(
-                "INSERT INTO codes (code, order_id, customer_email, created_at) VALUES (?, ?, ?, ?)",
-                (code, order_id, email, datetime.datetime.utcnow().isoformat()),
+                "INSERT INTO codes (code, order_id, customer_email, token_value, created_at) VALUES (?, ?, ?, ?, ?)",
+                (code, order_id, email, value, datetime.datetime.utcnow().isoformat()),
             )
-            codes.append(code)
+            codes.append((code, value))
         conn.commit()
 
     if email != "unknown":
@@ -243,7 +256,7 @@ def is_admin(interaction: discord.Interaction) -> bool:
 
 @client.tree.command(
     name="redeem",
-    description="Redeem a purchased code to add a token to your balance",
+    description="Redeem a purchased code to add tokens to your balance",
     guild=discord.Object(id=GUILD_ID),
 )
 @app_commands.describe(code="The code from your order confirmation email")
@@ -252,7 +265,7 @@ async def redeem(interaction: discord.Interaction, code: str):
     user_id = str(interaction.user.id)
 
     with db_lock:
-        row = conn.execute("SELECT used FROM codes WHERE code = ?", (code,)).fetchone()
+        row = conn.execute("SELECT used, token_value FROM codes WHERE code = ?", (code,)).fetchone()
 
         if row is None:
             await interaction.response.send_message("That code isn't valid.", ephemeral=True)
@@ -261,20 +274,22 @@ async def redeem(interaction: discord.Interaction, code: str):
             await interaction.response.send_message("That code has already been used.", ephemeral=True)
             return
 
+        value = row[1] or 1
+
         conn.execute(
             "UPDATE codes SET used = 1, redeemed_by = ?, redeemed_at = ? WHERE code = ?",
             (user_id, datetime.datetime.utcnow().isoformat(), code),
         )
         conn.execute(
-            "INSERT INTO balances (discord_user_id, tokens) VALUES (?, 1) "
-            "ON CONFLICT(discord_user_id) DO UPDATE SET tokens = tokens + 1",
-            (user_id,),
+            "INSERT INTO balances (discord_user_id, tokens) VALUES (?, ?) "
+            "ON CONFLICT(discord_user_id) DO UPDATE SET tokens = tokens + ?",
+            (user_id, value, value),
         )
         conn.commit()
         new_balance = get_balance(user_id)
 
     await interaction.response.send_message(
-        f"Token added! You now have {new_balance} token(s). Use /book to reserve a slot.",
+        f"{value} token(s) added! You now have {new_balance} token(s). Use /book to reserve a slot.",
         ephemeral=True,
     )
 
@@ -423,6 +438,33 @@ async def removeslot(interaction: discord.Interaction, key: str):
         await interaction.response.send_message(f"No slot found with key '{key}'.", ephemeral=True)
     else:
         await interaction.response.send_message(f"Slot '{key}' removed.", ephemeral=True)
+
+@client.tree.command(
+    name="createcode",
+    description="[Admin] Manually generate a redemption code worth N tokens",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(value="How many tokens this code is worth", note="Optional note, e.g. customer email or reason")
+async def createcode(interaction: discord.Interaction, value: int, note: str = ""):
+    if not is_admin(interaction):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    if value <= 0:
+        await interaction.response.send_message("Value must be positive.", ephemeral=True)
+        return
+
+    code = secrets.token_hex(4).upper()
+    with db_lock:
+        conn.execute(
+            "INSERT INTO codes (code, order_id, customer_email, token_value, created_at) VALUES (?, ?, ?, ?, ?)",
+            (code, "manual", note or "manual", value, datetime.datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+
+    await interaction.response.send_message(
+        f"Created code `{code}` worth {value} token(s). Give this to whoever should redeem it with /redeem.",
+        ephemeral=True,
+    )
 
 @client.tree.command(
     name="addbalance",
