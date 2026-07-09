@@ -13,7 +13,7 @@ Flow:
      a booked slot starts, and deletes it automatically when it ends.
 
 Run:
-  pip install discord.py flask python-dotenv
+  pip install discord.py flask python-dotenv openpyxl
   python voice_slot_bot.py
 
 Environment variables (put these in a .env file or your host's config):
@@ -44,6 +44,7 @@ from discord import app_commands
 from discord.ext import tasks
 from flask import Flask, request, abort
 from dotenv import load_dotenv
+from openpyxl import Workbook
 
 load_dotenv()
 
@@ -319,6 +320,21 @@ def get_student_text_channel(discord_user_id: str):
     ).fetchone()
     return row[0] if row else None
 
+async def reply(interaction: discord.Interaction, content: str, ephemeral: bool = True):
+    """Sends the bot's reply to the command user, and also posts a copy into
+    their private student channel so tutors can see every response the bot
+    gives, not just the command that triggered it."""
+    await interaction.response.send_message(content, ephemeral=ephemeral)
+
+    text_channel_id = get_student_text_channel(str(interaction.user.id))
+    if text_channel_id:
+        channel = client.get_channel(int(text_channel_id))
+        if channel is not None:
+            try:
+                await channel.send(f"🤖 Bot replied to {interaction.user.mention}:\n{content}")
+            except discord.HTTPException:
+                pass
+
 @client.tree.interaction_check
 async def log_commands_to_student_channel(interaction: discord.Interaction) -> bool:
     if interaction.type != discord.InteractionType.application_command:
@@ -357,10 +373,10 @@ async def redeem(interaction: discord.Interaction, code: str):
         row = conn.execute("SELECT used, token_value FROM codes WHERE code = ?", (code,)).fetchone()
 
         if row is None:
-            await interaction.response.send_message("That code isn't valid.", ephemeral=True)
+            await reply(interaction, "That code isn't valid.", ephemeral=True)
             return
         if row[0] == 1:
-            await interaction.response.send_message("That code has already been used.", ephemeral=True)
+            await reply(interaction, "That code has already been used.", ephemeral=True)
             return
 
         value = row[1] or 1
@@ -377,7 +393,7 @@ async def redeem(interaction: discord.Interaction, code: str):
         conn.commit()
         new_balance = get_balance(user_id)
 
-    await interaction.response.send_message(
+    await reply(interaction, 
         f"{value} token(s) added! You now have {new_balance} token(s). Use /book to reserve a slot.",
         ephemeral=True,
     )
@@ -407,7 +423,7 @@ async def book(interaction: discord.Interaction, date: str, slot: str):
 
     slots = get_slots()
     if slot_key not in slots:
-        await interaction.response.send_message(
+        await reply(interaction, 
             "That slot doesn't exist. Use /listslots to see current options.", ephemeral=True
         )
         return
@@ -415,7 +431,7 @@ async def book(interaction: discord.Interaction, date: str, slot: str):
     try:
         booking_date = datetime.datetime.strptime(date, "%Y-%m-%d").date()
     except ValueError:
-        await interaction.response.send_message(
+        await reply(interaction, 
             "Invalid date format. Use YYYY-MM-DD, e.g. 2026-07-15.", ephemeral=True
         )
         return
@@ -426,7 +442,7 @@ async def book(interaction: discord.Interaction, date: str, slot: str):
     now = datetime.datetime.now(TZ)
 
     if end_dt <= now:
-        await interaction.response.send_message(
+        await reply(interaction, 
             "That slot has already ended. Pick a future date/slot.", ephemeral=True
         )
         return
@@ -434,7 +450,7 @@ async def book(interaction: discord.Interaction, date: str, slot: str):
     with db_lock:
         balance = get_balance(user_id)
         if balance < 1:
-            await interaction.response.send_message(
+            await reply(interaction, 
                 "You don't have any tokens. Redeem a code first with /redeem.", ephemeral=True
             )
             return
@@ -445,7 +461,7 @@ async def book(interaction: discord.Interaction, date: str, slot: str):
             (user_id, date, slot_key),
         ).fetchone()
         if dupe:
-            await interaction.response.send_message(
+            await reply(interaction, 
                 "You've already booked that exact slot.", ephemeral=True
             )
             return
@@ -470,7 +486,7 @@ async def book(interaction: discord.Interaction, date: str, slot: str):
         "and close automatically when it ends."
     )
 
-    await interaction.response.send_message(
+    await reply(interaction, 
         f"Booked! {date} {label} (Eastern). {timing_note}",
         ephemeral=True,
     )
@@ -483,10 +499,10 @@ async def book(interaction: discord.Interaction, date: str, slot: str):
 async def listslots(interaction: discord.Interaction):
     slots = get_slots()
     if not slots:
-        await interaction.response.send_message("No slots are configured.", ephemeral=True)
+        await reply(interaction, "No slots are configured.", ephemeral=True)
         return
     text = "\n".join(f"  {key} — {label}" for key, (_, _, label) in sorted(slots.items()))
-    await interaction.response.send_message(f"Current slots:\n{text}", ephemeral=True)
+    await reply(interaction, f"Current slots:\n{text}", ephemeral=True)
 
 @client.tree.command(
     name="addslot",
@@ -501,10 +517,10 @@ async def listslots(interaction: discord.Interaction):
 )
 async def addslot(interaction: discord.Interaction, key: str, start_hour: int, end_hour: int, label: str):
     if not is_admin(interaction):
-        await interaction.response.send_message("Admins only.", ephemeral=True)
+        await reply(interaction, "Admins only.", ephemeral=True)
         return
     if not (0 <= start_hour < 24 and 0 < end_hour <= 24 and start_hour < end_hour):
-        await interaction.response.send_message("Hours must be 0-24 and start before end.", ephemeral=True)
+        await reply(interaction, "Hours must be 0-24 and start before end.", ephemeral=True)
         return
 
     with db_lock:
@@ -515,7 +531,7 @@ async def addslot(interaction: discord.Interaction, key: str, start_hour: int, e
         )
         conn.commit()
 
-    await interaction.response.send_message(f"Slot '{key}' set to {label}.", ephemeral=True)
+    await reply(interaction, f"Slot '{key}' set to {label}.", ephemeral=True)
 
 @client.tree.command(
     name="removeslot",
@@ -525,7 +541,7 @@ async def addslot(interaction: discord.Interaction, key: str, start_hour: int, e
 @app_commands.describe(key="The slot identifier to remove, e.g. '9-12'")
 async def removeslot(interaction: discord.Interaction, key: str):
     if not is_admin(interaction):
-        await interaction.response.send_message("Admins only.", ephemeral=True)
+        await reply(interaction, "Admins only.", ephemeral=True)
         return
 
     with db_lock:
@@ -533,9 +549,9 @@ async def removeslot(interaction: discord.Interaction, key: str):
         conn.commit()
 
     if cur.rowcount == 0:
-        await interaction.response.send_message(f"No slot found with key '{key}'.", ephemeral=True)
+        await reply(interaction, f"No slot found with key '{key}'.", ephemeral=True)
     else:
-        await interaction.response.send_message(f"Slot '{key}' removed.", ephemeral=True)
+        await reply(interaction, f"Slot '{key}' removed.", ephemeral=True)
 
 @client.tree.command(
     name="createcode",
@@ -545,10 +561,10 @@ async def removeslot(interaction: discord.Interaction, key: str):
 @app_commands.describe(value="How many tokens this code is worth", note="Optional note, e.g. customer email or reason")
 async def createcode(interaction: discord.Interaction, value: int, note: str = ""):
     if not is_admin(interaction):
-        await interaction.response.send_message("Admins only.", ephemeral=True)
+        await reply(interaction, "Admins only.", ephemeral=True)
         return
     if value <= 0:
-        await interaction.response.send_message("Value must be positive.", ephemeral=True)
+        await reply(interaction, "Value must be positive.", ephemeral=True)
         return
 
     code = secrets.token_hex(4).upper()
@@ -559,7 +575,7 @@ async def createcode(interaction: discord.Interaction, value: int, note: str = "
         )
         conn.commit()
 
-    await interaction.response.send_message(
+    await reply(interaction, 
         f"Created code `{code}` worth {value} token(s). Give this to whoever should redeem it with /redeem.",
         ephemeral=True,
     )
@@ -572,10 +588,10 @@ async def createcode(interaction: discord.Interaction, value: int, note: str = "
 @app_commands.describe(user="The user to credit", amount="How many tokens to add")
 async def addbalance(interaction: discord.Interaction, user: discord.Member, amount: int):
     if not is_admin(interaction):
-        await interaction.response.send_message("Admins only.", ephemeral=True)
+        await reply(interaction, "Admins only.", ephemeral=True)
         return
     if amount <= 0:
-        await interaction.response.send_message("Amount must be positive.", ephemeral=True)
+        await reply(interaction, "Amount must be positive.", ephemeral=True)
         return
 
     user_id = str(user.id)
@@ -588,7 +604,7 @@ async def addbalance(interaction: discord.Interaction, user: discord.Member, amo
         conn.commit()
         new_balance = get_balance(user_id)
 
-    await interaction.response.send_message(
+    await reply(interaction, 
         f"Added {amount} token(s) to {user.mention}. New balance: {new_balance}.", ephemeral=True
     )
 
@@ -600,10 +616,10 @@ async def addbalance(interaction: discord.Interaction, user: discord.Member, amo
 @app_commands.describe(user="The user to debit", amount="How many tokens to remove")
 async def removebalance(interaction: discord.Interaction, user: discord.Member, amount: int):
     if not is_admin(interaction):
-        await interaction.response.send_message("Admins only.", ephemeral=True)
+        await reply(interaction, "Admins only.", ephemeral=True)
         return
     if amount <= 0:
-        await interaction.response.send_message("Amount must be positive.", ephemeral=True)
+        await reply(interaction, "Amount must be positive.", ephemeral=True)
         return
 
     user_id = str(user.id)
@@ -617,8 +633,44 @@ async def removebalance(interaction: discord.Interaction, user: discord.Member, 
         )
         conn.commit()
 
-    await interaction.response.send_message(
+    await reply(interaction, 
         f"Removed {amount} token(s) from {user.mention}. New balance: {new_amount}.", ephemeral=True
+    )
+
+@client.tree.command(
+    name="exportbalances",
+    description="[Admin] Download all token balances as an Excel file",
+    guild=discord.Object(id=GUILD_ID),
+)
+async def exportbalances(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await reply(interaction, "Admins only.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+    rows = conn.execute(
+        "SELECT discord_user_id, tokens FROM balances ORDER BY tokens DESC"
+    ).fetchall()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Balances"
+    ws.append(["Discord User ID", "Username", "Token Balance"])
+
+    for user_id, tokens in rows:
+        member = guild.get_member(int(user_id)) if guild else None
+        username = member.display_name if member else "(not in server)"
+        ws.append([user_id, username, tokens])
+
+    file_path = "/tmp/balances.xlsx"
+    wb.save(file_path)
+
+    await interaction.followup.send(
+        "Current token balances:",
+        file=discord.File(file_path, filename="balances.xlsx"),
+        ephemeral=True,
     )
 
 @client.tree.command(
@@ -641,7 +693,7 @@ async def mybookings(interaction: discord.Interaction):
     else:
         booking_text = "\n".join(f"  {d} — {s} ({st})" for d, s, st in rows)
 
-    await interaction.response.send_message(
+    await reply(interaction, 
         f"Token balance: {balance}\n\nBookings:\n{booking_text}", ephemeral=True
     )
 
@@ -652,7 +704,7 @@ async def mybookings(interaction: discord.Interaction):
 )
 async def checkbalance(interaction: discord.Interaction):
     balance = get_balance(str(interaction.user.id))
-    await interaction.response.send_message(
+    await reply(interaction, 
         f"Your token balance: {balance}", ephemeral=True
     )
 
