@@ -21,6 +21,7 @@ Environment variables (put these in a .env file or your host's config):
   SHOPIFY_WEBHOOK_SECRET- from Shopify Admin > Settings > Notifications > Webhooks
   GUILD_ID              - your Discord server (guild) ID
   FLASK_PORT            - port for the webhook server (default 5000, ignored on Railway)
+  DB_PATH               - path to the SQLite file (default "slots.db"; on Railway, point this at a mounted Volume, e.g. /data/slots.db, or the database resets on every deploy)
   GMAIL_ADDRESS         - Gmail address to send redemption codes from
   GMAIL_APP_PASSWORD    - 16-character Gmail App Password (not your normal password)
   TOKEN_PRODUCT_ID      - Shopify product ID for the token product (only this product's line items generate codes)
@@ -58,7 +59,7 @@ TOKEN_PRODUCT_ID = os.environ["TOKEN_PRODUCT_ID"]
 TUTOR_ROLE_ID = int(os.environ["TUTOR_ROLE_ID"])
 
 TZ = ZoneInfo("America/Toronto")
-DB_PATH = "slots.db"
+DB_PATH = os.environ.get("DB_PATH", "slots.db")
 
 # Default daily slots, seeded into the DB on first run. After that, slots
 # live in the slot_definitions table and admins manage them with
