@@ -335,16 +335,26 @@ async def reply(interaction: discord.Interaction, content: str, ephemeral: bool 
             except discord.HTTPException:
                 pass
 
+async def admin_reply(interaction: discord.Interaction, content: str, ephemeral: bool = True):
+    """Admin-only command reply — stays private to the admin, never logged
+    into any student's channel."""
+    await interaction.response.send_message(content, ephemeral=ephemeral)
+
+ADMIN_COMMANDS = {"addslot", "removeslot", "createcode", "addbalance", "removebalance", "exportbalances"}
+
 @client.tree.interaction_check
 async def log_commands_to_student_channel(interaction: discord.Interaction) -> bool:
     if interaction.type != discord.InteractionType.application_command:
+        return True
+
+    cmd_name = interaction.command.name if interaction.command else "unknown"
+    if cmd_name in ADMIN_COMMANDS:
         return True
 
     text_channel_id = get_student_text_channel(str(interaction.user.id))
     if text_channel_id:
         channel = client.get_channel(int(text_channel_id))
         if channel is not None:
-            cmd_name = interaction.command.name if interaction.command else "unknown"
             params = " ".join(f"{k}:{v}" for k, v in interaction.namespace.__dict__.items())
             try:
                 await channel.send(f"📋 {interaction.user.mention} ran `/{cmd_name} {params}`")
@@ -517,10 +527,10 @@ async def listslots(interaction: discord.Interaction):
 )
 async def addslot(interaction: discord.Interaction, key: str, start_hour: int, end_hour: int, label: str):
     if not is_admin(interaction):
-        await reply(interaction, "Admins only.", ephemeral=True)
+        await admin_reply(interaction, "Admins only.", ephemeral=True)
         return
     if not (0 <= start_hour < 24 and 0 < end_hour <= 24 and start_hour < end_hour):
-        await reply(interaction, "Hours must be 0-24 and start before end.", ephemeral=True)
+        await admin_reply(interaction, "Hours must be 0-24 and start before end.", ephemeral=True)
         return
 
     with db_lock:
@@ -531,7 +541,7 @@ async def addslot(interaction: discord.Interaction, key: str, start_hour: int, e
         )
         conn.commit()
 
-    await reply(interaction, f"Slot '{key}' set to {label}.", ephemeral=True)
+    await admin_reply(interaction, f"Slot '{key}' set to {label}.", ephemeral=True)
 
 @client.tree.command(
     name="removeslot",
@@ -541,7 +551,7 @@ async def addslot(interaction: discord.Interaction, key: str, start_hour: int, e
 @app_commands.describe(key="The slot identifier to remove, e.g. '9-12'")
 async def removeslot(interaction: discord.Interaction, key: str):
     if not is_admin(interaction):
-        await reply(interaction, "Admins only.", ephemeral=True)
+        await admin_reply(interaction, "Admins only.", ephemeral=True)
         return
 
     with db_lock:
@@ -549,9 +559,9 @@ async def removeslot(interaction: discord.Interaction, key: str):
         conn.commit()
 
     if cur.rowcount == 0:
-        await reply(interaction, f"No slot found with key '{key}'.", ephemeral=True)
+        await admin_reply(interaction, f"No slot found with key '{key}'.", ephemeral=True)
     else:
-        await reply(interaction, f"Slot '{key}' removed.", ephemeral=True)
+        await admin_reply(interaction, f"Slot '{key}' removed.", ephemeral=True)
 
 @client.tree.command(
     name="createcode",
@@ -561,10 +571,10 @@ async def removeslot(interaction: discord.Interaction, key: str):
 @app_commands.describe(value="How many tokens this code is worth", note="Optional note, e.g. customer email or reason")
 async def createcode(interaction: discord.Interaction, value: int, note: str = ""):
     if not is_admin(interaction):
-        await reply(interaction, "Admins only.", ephemeral=True)
+        await admin_reply(interaction, "Admins only.", ephemeral=True)
         return
     if value <= 0:
-        await reply(interaction, "Value must be positive.", ephemeral=True)
+        await admin_reply(interaction, "Value must be positive.", ephemeral=True)
         return
 
     code = secrets.token_hex(4).upper()
@@ -575,7 +585,7 @@ async def createcode(interaction: discord.Interaction, value: int, note: str = "
         )
         conn.commit()
 
-    await reply(interaction, 
+    await admin_reply(interaction, 
         f"Created code `{code}` worth {value} token(s). Give this to whoever should redeem it with /redeem.",
         ephemeral=True,
     )
@@ -588,10 +598,10 @@ async def createcode(interaction: discord.Interaction, value: int, note: str = "
 @app_commands.describe(user="The user to credit", amount="How many tokens to add")
 async def addbalance(interaction: discord.Interaction, user: discord.Member, amount: int):
     if not is_admin(interaction):
-        await reply(interaction, "Admins only.", ephemeral=True)
+        await admin_reply(interaction, "Admins only.", ephemeral=True)
         return
     if amount <= 0:
-        await reply(interaction, "Amount must be positive.", ephemeral=True)
+        await admin_reply(interaction, "Amount must be positive.", ephemeral=True)
         return
 
     user_id = str(user.id)
@@ -604,7 +614,7 @@ async def addbalance(interaction: discord.Interaction, user: discord.Member, amo
         conn.commit()
         new_balance = get_balance(user_id)
 
-    await reply(interaction, 
+    await admin_reply(interaction, 
         f"Added {amount} token(s) to {user.mention}. New balance: {new_balance}.", ephemeral=True
     )
 
@@ -616,10 +626,10 @@ async def addbalance(interaction: discord.Interaction, user: discord.Member, amo
 @app_commands.describe(user="The user to debit", amount="How many tokens to remove")
 async def removebalance(interaction: discord.Interaction, user: discord.Member, amount: int):
     if not is_admin(interaction):
-        await reply(interaction, "Admins only.", ephemeral=True)
+        await admin_reply(interaction, "Admins only.", ephemeral=True)
         return
     if amount <= 0:
-        await reply(interaction, "Amount must be positive.", ephemeral=True)
+        await admin_reply(interaction, "Amount must be positive.", ephemeral=True)
         return
 
     user_id = str(user.id)
@@ -633,7 +643,7 @@ async def removebalance(interaction: discord.Interaction, user: discord.Member, 
         )
         conn.commit()
 
-    await reply(interaction, 
+    await admin_reply(interaction, 
         f"Removed {amount} token(s) from {user.mention}. New balance: {new_amount}.", ephemeral=True
     )
 
