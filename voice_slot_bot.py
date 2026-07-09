@@ -322,47 +322,31 @@ def get_student_text_channel(discord_user_id: str):
     return row[0] if row else None
 
 async def reply(interaction: discord.Interaction, content: str, ephemeral: bool = True):
-    """Sends the bot's reply to the command user, and also posts a copy into
-    their private student channel so tutors can see every response the bot
-    gives, not just the command that triggered it."""
-    await interaction.response.send_message(content, ephemeral=ephemeral)
-
+    """Replies directly in the channel as a normal message, so tutors see it
+    naturally (Discord also shows the /command that triggered it automatically
+    for non-ephemeral responses — no separate logging needed). Only falls
+    back to a private ephemeral reply if the command wasn't run inside the
+    student's own private channel, to avoid leaking things like redemption
+    codes into a channel other people can see."""
     text_channel_id = get_student_text_channel(str(interaction.user.id))
-    if text_channel_id:
-        channel = client.get_channel(int(text_channel_id))
-        if channel is not None:
-            try:
-                await channel.send(f"🤖 Bot replied to {interaction.user.mention}:\n{content}")
-            except discord.HTTPException:
-                pass
+    in_own_channel = (
+        text_channel_id is not None
+        and interaction.channel is not None
+        and str(interaction.channel.id) == text_channel_id
+    )
+
+    if in_own_channel:
+        await interaction.response.send_message(content)
+    else:
+        await interaction.response.send_message(
+            f"{content}\n\n(Tip: run commands in your private channel so tutors can see them.)",
+            ephemeral=True,
+        )
 
 async def admin_reply(interaction: discord.Interaction, content: str, ephemeral: bool = True):
-    """Admin-only command reply — stays private to the admin, never logged
-    into any student's channel."""
+    """Admin-only command reply — stays private to the admin, never shown
+    in any student's channel."""
     await interaction.response.send_message(content, ephemeral=ephemeral)
-
-ADMIN_COMMANDS = {"addslot", "removeslot", "createcode", "addbalance", "removebalance", "exportbalances"}
-
-@client.tree.interaction_check
-async def log_commands_to_student_channel(interaction: discord.Interaction) -> bool:
-    if interaction.type != discord.InteractionType.application_command:
-        return True
-
-    cmd_name = interaction.command.name if interaction.command else "unknown"
-    if cmd_name in ADMIN_COMMANDS:
-        return True
-
-    text_channel_id = get_student_text_channel(str(interaction.user.id))
-    if text_channel_id:
-        channel = client.get_channel(int(text_channel_id))
-        if channel is not None:
-            params = " ".join(f"{k}:{v}" for k, v in interaction.namespace.__dict__.items())
-            try:
-                await channel.send(f"📋 {interaction.user.mention} ran `/{cmd_name} {params}`")
-            except discord.HTTPException:
-                pass
-
-    return True
 
 @client.event
 async def on_member_join(member: discord.Member):
