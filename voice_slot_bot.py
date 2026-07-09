@@ -280,6 +280,30 @@ async def ensure_student_channels(guild: discord.Guild, member: discord.Member):
         if category is not None and text_channel is not None:
             return category, text_channel
 
+    # DB has no record (e.g. it was reset) but a folder may already exist
+    # from before — look for a category that's private to exactly this
+    # member before creating a new (duplicate) one.
+    existing_category = None
+    for cat in guild.categories:
+        overwrite = cat.overwrites_for(member)
+        everyone_overwrite = cat.overwrites_for(guild.default_role)
+        if overwrite.view_channel is True and everyone_overwrite.view_channel is False:
+            existing_category = cat
+            break
+
+    if existing_category is not None:
+        existing_text = discord.utils.get(existing_category.text_channels, name="chat")
+        if existing_text is not None:
+            with db_lock:
+                conn.execute(
+                    "INSERT INTO student_channels (discord_user_id, category_id, text_channel_id) VALUES (?, ?, ?) "
+                    "ON CONFLICT(discord_user_id) DO UPDATE SET category_id = ?, text_channel_id = ?",
+                    (str(member.id), str(existing_category.id), str(existing_text.id),
+                     str(existing_category.id), str(existing_text.id)),
+                )
+                conn.commit()
+            return existing_category, existing_text
+
     tutor_role = guild.get_role(TUTOR_ROLE_ID)
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
@@ -291,7 +315,8 @@ async def ensure_student_channels(guild: discord.Guild, member: discord.Member):
             view_channel=True, connect=True, send_messages=True, read_message_history=True
         )
 
-    category = await guild.create_category(name=member.display_name[:100], overwrites=overwrites)
+    category_name = f"{member.display_name}-{str(member.id)[-4:]}"[:100]
+    category = await guild.create_category(name=category_name, overwrites=overwrites)
     text_channel = await guild.create_text_channel(
         name="chat", overwrites=overwrites, category=category
     )
