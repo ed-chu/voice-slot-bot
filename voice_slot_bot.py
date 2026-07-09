@@ -20,10 +20,11 @@ Environment variables (put these in a .env file or your host's config):
   DISCORD_BOT_TOKEN     - bot token from the Discord Developer Portal
   SHOPIFY_WEBHOOK_SECRET- from Shopify Admin > Settings > Notifications > Webhooks
   GUILD_ID              - your Discord server (guild) ID
-  CATEGORY_ID           - (optional) category ID to create booking channels under
   FLASK_PORT            - port for the webhook server (default 5000, ignored on Railway)
   GMAIL_ADDRESS         - Gmail address to send redemption codes from
   GMAIL_APP_PASSWORD    - 16-character Gmail App Password (not your normal password)
+  TOKEN_PRODUCT_ID      - Shopify product ID for the token product (only this product's line items generate codes)
+  TUTOR_ROLE_ID         - Discord role ID for tutors; they get access to every student's private text channel
 """
 
 import os
@@ -49,11 +50,11 @@ load_dotenv()
 DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 SHOPIFY_WEBHOOK_SECRET = os.environ["SHOPIFY_WEBHOOK_SECRET"]
 GUILD_ID = int(os.environ["GUILD_ID"])
-CATEGORY_ID = os.environ.get("CATEGORY_ID")
-CATEGORY_ID = int(CATEGORY_ID) if CATEGORY_ID else None
 FLASK_PORT = int(os.environ.get("FLASK_PORT", 5000))
 GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
+TOKEN_PRODUCT_ID = os.environ["TOKEN_PRODUCT_ID"]
+TUTOR_ROLE_ID = int(os.environ["TUTOR_ROLE_ID"])
 
 TZ = ZoneInfo("America/Toronto")
 DB_PATH = "slots.db"
@@ -107,6 +108,13 @@ def db_conn():
             end_ts TEXT,
             channel_id TEXT,
             status TEXT DEFAULT 'booked'
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS student_channels (
+            discord_user_id TEXT PRIMARY KEY,
+            category_id TEXT,
+            text_channel_id TEXT
         )
     """)
     conn.execute("""
@@ -188,12 +196,18 @@ def order_created():
     order_id = str(order.get("id"))
     email = order.get("email") or order.get("contact_email") or "unknown"
 
-    # One code per line item, worth that item's quantity in tokens. So
-    # buying quantity 5 of the token product produces a single code worth
-    # 5 tokens, rather than 5 separate 1-token codes. If your store sells
-    # other products too, filter this to only include line items matching
-    # your token product's ID/SKU.
-    line_items = order.get("line_items", []) or [{"quantity": 1}]
+    # One code per matching line item, worth that item's quantity in
+    # tokens. Only line items for the configured token product are
+    # counted — other products in the store (if any) are ignored.
+    all_line_items = order.get("line_items", [])
+    line_items = [
+        item for item in all_line_items
+        if str(item.get("product_id")) == TOKEN_PRODUCT_ID
+    ]
+
+    if not line_items:
+        print(f"[webhook] order {order_id} had no matching token product line items, skipping")
+        return "ok", 200
 
     codes = []  # list of (code, value) tuples
     with db_lock:
@@ -251,8 +265,83 @@ def get_slots() -> dict:
     rows = conn.execute("SELECT slot_key, start_hour, end_hour, label FROM slot_definitions").fetchall()
     return {key: (start_h, end_h, label) for key, start_h, end_h, label in rows}
 
+async def ensure_student_channels(guild: discord.Guild, member: discord.Member):
+    """Returns (category, text_channel), creating them if this student doesn't have them yet."""
+    row = conn.execute(
+        "SELECT category_id, text_channel_id FROM student_channels WHERE discord_user_id = ?",
+        (str(member.id),),
+    ).fetchone()
+
+    if row:
+        category = guild.get_channel(int(row[0])) if row[0] else None
+        text_channel = guild.get_channel(int(row[1])) if row[1] else None
+        if category is not None and text_channel is not None:
+            return category, text_channel
+
+    tutor_role = guild.get_role(TUTOR_ROLE_ID)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
+        member: discord.PermissionOverwrite(view_channel=True, connect=True, send_messages=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, send_messages=True, manage_channels=True),
+    }
+    if tutor_role is not None:
+        overwrites[tutor_role] = discord.PermissionOverwrite(
+            view_channel=True, connect=True, send_messages=True, read_message_history=True
+        )
+
+    category = await guild.create_category(name=member.display_name[:100], overwrites=overwrites)
+    text_channel = await guild.create_text_channel(
+        name="chat", overwrites=overwrites, category=category
+    )
+
+    with db_lock:
+        conn.execute(
+            "INSERT INTO student_channels (discord_user_id, category_id, text_channel_id) VALUES (?, ?, ?) "
+            "ON CONFLICT(discord_user_id) DO UPDATE SET category_id = ?, text_channel_id = ?",
+            (str(member.id), str(category.id), str(text_channel.id), str(category.id), str(text_channel.id)),
+        )
+        conn.commit()
+
+    await text_channel.send(
+        f"{member.mention} welcome! This is your private space — only you and tutors can see it. "
+        f"Use this channel for commands and questions."
+    )
+
+    return category, text_channel
+
 def is_admin(interaction: discord.Interaction) -> bool:
     return interaction.user.guild_permissions.administrator
+
+def get_student_text_channel(discord_user_id: str):
+    row = conn.execute(
+        "SELECT text_channel_id FROM student_channels WHERE discord_user_id = ?",
+        (discord_user_id,),
+    ).fetchone()
+    return row[0] if row else None
+
+@client.tree.interaction_check
+async def log_commands_to_student_channel(interaction: discord.Interaction) -> bool:
+    if interaction.type != discord.InteractionType.application_command:
+        return True
+
+    text_channel_id = get_student_text_channel(str(interaction.user.id))
+    if text_channel_id:
+        channel = client.get_channel(int(text_channel_id))
+        if channel is not None:
+            cmd_name = interaction.command.name if interaction.command else "unknown"
+            params = " ".join(f"{k}:{v}" for k, v in interaction.namespace.__dict__.items())
+            try:
+                await channel.send(f"📋 {interaction.user.mention} ran `/{cmd_name} {params}`")
+            except discord.HTTPException:
+                pass
+
+    return True
+
+@client.event
+async def on_member_join(member: discord.Member):
+    if member.bot:
+        return
+    await ensure_student_channels(member.guild, member)
 
 @client.tree.command(
     name="redeem",
@@ -336,9 +425,9 @@ async def book(interaction: discord.Interaction, date: str, slot: str):
     end_dt = datetime.datetime.combine(booking_date, datetime.time(hour=end_hour), tzinfo=TZ)
     now = datetime.datetime.now(TZ)
 
-    if start_dt <= now:
+    if end_dt <= now:
         await interaction.response.send_message(
-            "That slot is in the past or already started. Pick a future date/slot.", ephemeral=True
+            "That slot has already ended. Pick a future date/slot.", ephemeral=True
         )
         return
 
@@ -371,9 +460,18 @@ async def book(interaction: discord.Interaction, date: str, slot: str):
         )
         conn.commit()
 
+    joined_late = start_dt <= now
+    timing_note = (
+        "The slot has already started, so your channel will appear within a minute "
+        f"and still end at the scheduled time ({end_dt.strftime('%-I:%M%p')} Eastern) — "
+        "you won't get extra time for joining late."
+        if joined_late else
+        "Your private voice channel will appear automatically when the slot starts, "
+        "and close automatically when it ends."
+    )
+
     await interaction.response.send_message(
-        f"Booked! {date} {label} (Eastern). Your private voice channel will appear "
-        f"automatically when the slot starts, and close automatically when it ends.",
+        f"Booked! {date} {label} (Eastern). {timing_note}",
         ephemeral=True,
     )
 
@@ -547,6 +645,17 @@ async def mybookings(interaction: discord.Interaction):
         f"Token balance: {balance}\n\nBookings:\n{booking_text}", ephemeral=True
     )
 
+@client.tree.command(
+    name="checkbalance",
+    description="Check your current token balance",
+    guild=discord.Object(id=GUILD_ID),
+)
+async def checkbalance(interaction: discord.Interaction):
+    balance = get_balance(str(interaction.user.id))
+    await interaction.response.send_message(
+        f"Your token balance: {balance}", ephemeral=True
+    )
+
 # ---------------------------------------------------------------------------
 # Scheduler: create channels when slots start, delete when they end
 # ---------------------------------------------------------------------------
@@ -559,7 +668,7 @@ async def slot_scheduler():
 
     now = datetime.datetime.now(TZ)
 
-    # Start slots that have just begun and don't have a channel yet.
+    # Start slots that have just begun and don't have channels yet.
     to_start = conn.execute(
         "SELECT id, discord_user_id, start_ts, end_ts FROM bookings "
         "WHERE status = 'booked' AND channel_id IS NULL"
@@ -572,34 +681,41 @@ async def slot_scheduler():
             if member is None:
                 continue
 
-            overwrites = {
+            category, text_channel = await ensure_student_channels(guild, member)
+
+            tutor_role = guild.get_role(TUTOR_ROLE_ID)
+            voice_overwrites = {
                 guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
                 member: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True),
                 guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True),
             }
-            category = guild.get_channel(CATEGORY_ID) if CATEGORY_ID else None
+            if tutor_role is not None:
+                voice_overwrites[tutor_role] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
 
-            channel = await guild.create_voice_channel(
-                name=f"slot-{member.display_name}"[:32],
-                overwrites=overwrites,
+            voice_channel = await guild.create_voice_channel(
+                name="voice",
+                overwrites=voice_overwrites,
                 category=category,
             )
 
             with db_lock:
                 conn.execute(
                     "UPDATE bookings SET channel_id = ? WHERE id = ?",
-                    (str(channel.id), booking_id),
+                    (str(voice_channel.id), booking_id),
                 )
                 conn.commit()
 
+            await text_channel.send(
+                f"{member.mention} your slot has started — join your voice room: {voice_channel.mention}"
+            )
+
             try:
-                await member.send(
-                    f"Your slot has started! Join your private channel: {channel.mention}"
-                )
+                await member.send(f"Your slot has started! Join your voice room: {voice_channel.mention}")
             except discord.Forbidden:
                 pass  # user has DMs disabled
 
-    # End slots that are over: delete the channel, mark completed.
+    # End slots that are over: delete only the voice channel, mark completed.
+    # The student's text channel and category are permanent and untouched.
     to_end = conn.execute(
         "SELECT id, channel_id, end_ts FROM bookings "
         "WHERE status = 'booked' AND channel_id IS NOT NULL"
@@ -608,15 +724,15 @@ async def slot_scheduler():
     for booking_id, channel_id, end_ts in to_end:
         end_dt = datetime.datetime.fromisoformat(end_ts)
         if end_dt <= now:
-            channel = guild.get_channel(int(channel_id))
-            if channel is not None:
-                for member in list(channel.members):
+            voice_channel = guild.get_channel(int(channel_id))
+            if voice_channel is not None:
+                for member in list(voice_channel.members):
                     try:
                         await member.move_to(None)
                     except discord.HTTPException:
                         pass
                 try:
-                    await channel.delete(reason="Slot time expired")
+                    await voice_channel.delete(reason="Slot time expired")
                 except discord.HTTPException:
                     pass
 
