@@ -418,98 +418,195 @@ async def redeem(interaction: discord.Interaction, code: str):
         ephemeral=True,
     )
 
-async def slot_autocomplete(interaction: discord.Interaction, current: str):
-    slots = get_slots()
-    choices = [
-        app_commands.Choice(name=label, value=key)
-        for key, (_, _, label) in slots.items()
-        if current.lower() in label.lower() or current.lower() in key.lower()
-    ]
-    return choices[:25]
+NUMBER_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
+# In-memory map of message_id -> pending booking prompt details. Lost on
+# restart, which just means any prompt sent before a restart stops working —
+# the student can simply run /book again.
+pending_book_prompts: dict = {}
+
+def parse_month_day(date_str: str):
+    """Parses a date string with no year, e.g. '07-15', '7/15', 'July 15',
+    'Jul 15'. Returns (month, day) or None if it doesn't match anything."""
+    date_str = date_str.strip()
+    formats = ["%m-%d", "%m/%d", "%B %d", "%b %d", "%d %B", "%d %b"]
+    for fmt in formats:
+        try:
+            parsed = datetime.datetime.strptime(date_str, fmt)
+            return parsed.month, parsed.day
+        except ValueError:
+            continue
+    return None
 
 @client.tree.command(
     name="book",
-    description="Book a slot using one of your tokens",
+    description="See bookable slots for a date and react to book one",
     guild=discord.Object(id=GUILD_ID),
 )
-@app_commands.describe(
-    date="Date in YYYY-MM-DD format (Eastern time)",
-    slot="Which time slot (use /listslots to see options)",
-)
-@app_commands.autocomplete(slot=slot_autocomplete)
-async def book(interaction: discord.Interaction, date: str, slot: str):
+@app_commands.describe(date="Date without year, e.g. 07-15, 7/15, or 'July 15' — nearest upcoming occurrence is used")
+async def book(interaction: discord.Interaction, date: str):
     user_id = str(interaction.user.id)
-    slot_key = slot
 
-    slots = get_slots()
-    if slot_key not in slots:
-        await reply(interaction, 
-            "That slot doesn't exist. Use /listslots to see current options.", ephemeral=True
+    # Reactions can't be added to ephemeral messages, so this only works
+    # inside the student's own private channel.
+    text_channel_id = get_student_text_channel(user_id)
+    in_own_channel = (
+        text_channel_id is not None
+        and interaction.channel is not None
+        and str(interaction.channel.id) == text_channel_id
+    )
+    if not in_own_channel:
+        await interaction.response.send_message(
+            "Please run /book inside your own private channel.", ephemeral=True
         )
         return
+
+    parsed = parse_month_day(date)
+    if parsed is None:
+        await reply(interaction, "Couldn't understand that date. Try 07-15, 7/15, or 'July 15'.")
+        return
+
+    month, day = parsed
+    now = datetime.datetime.now(TZ)
+    today = now.date()
 
     try:
-        booking_date = datetime.datetime.strptime(date, "%Y-%m-%d").date()
+        candidate = datetime.date(today.year, month, day)
     except ValueError:
-        await reply(interaction, 
-            "Invalid date format. Use YYYY-MM-DD, e.g. 2026-07-15.", ephemeral=True
-        )
+        await reply(interaction, "That's not a valid date.")
         return
 
-    start_hour, end_hour, label = slots[slot_key]
-    start_dt = datetime.datetime.combine(booking_date, datetime.time(hour=start_hour), tzinfo=TZ)
-    end_dt = datetime.datetime.combine(booking_date, datetime.time(hour=end_hour), tzinfo=TZ)
+    if candidate < today:
+        try:
+            candidate = datetime.date(today.year + 1, month, day)
+        except ValueError:
+            await reply(interaction, "That date doesn't exist next year either (e.g. Feb 29).")
+            return
+
+    date_str = candidate.isoformat()
+    slots = get_slots()
+
+    options = []
+    for key, (start_h, end_h, label) in sorted(slots.items()):
+        start_dt = datetime.datetime.combine(candidate, datetime.time(hour=start_h), tzinfo=TZ)
+        end_dt = datetime.datetime.combine(candidate, datetime.time(hour=end_h), tzinfo=TZ)
+        if end_dt <= now:
+            continue  # fully in the past for this date, can't be booked
+        options.append((key, label, start_dt, end_dt))
+
+    if not options:
+        await reply(interaction, f"No bookable slots left for {date_str}.")
+        return
+
+    if len(options) > len(NUMBER_EMOJIS):
+        options = options[:len(NUMBER_EMOJIS)]
+
+    balance = get_balance(user_id)
+    lines = []
+    emoji_map = {}
+    for i, (key, label, start_dt, end_dt) in enumerate(options):
+        emoji = NUMBER_EMOJIS[i]
+        emoji_map[emoji] = key
+        started_note = " (already started)" if start_dt <= now else ""
+        lines.append(f"{emoji} {label}{started_note}")
+
+    content = (
+        f"Available slots for **{date_str}**:\n" + "\n".join(lines) +
+        f"\n\nReact with the emoji to book (costs 1 token — you have {balance})."
+    )
+
+    await interaction.response.send_message(content)
+    message = await interaction.original_response()
+
+    for emoji in emoji_map:
+        try:
+            await message.add_reaction(emoji)
+        except discord.HTTPException:
+            pass
+
+    pending_book_prompts[message.id] = {
+        "user_id": interaction.user.id,
+        "date_str": date_str,
+        "options": options,
+        "emoji_map": emoji_map,
+    }
+
+@client.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if payload.guild_id is None or payload.user_id == client.user.id:
+        return
+
+    prompt = pending_book_prompts.get(payload.message_id)
+    if prompt is None or payload.user_id != prompt["user_id"]:
+        return
+
+    key = prompt["emoji_map"].get(str(payload.emoji))
+    if key is None:
+        return
+
+    option = next((o for o in prompt["options"] if o[0] == key), None)
+    if option is None:
+        return
+
+    # Claim the prompt right now, before any awaits — this is the only
+    # point where another near-simultaneous reaction could interleave, so
+    # popping here (synchronously) guarantees only the very first valid
+    # reaction can ever proceed. Any later reaction on this message,
+    # whatever emoji, finds nothing and is ignored.
+    pending_book_prompts.pop(payload.message_id, None)
+
+    channel = client.get_channel(payload.channel_id)
+    if channel is None:
+        return
+
+    _, label, start_dt, end_dt = option
     now = datetime.datetime.now(TZ)
 
     if end_dt <= now:
-        await reply(interaction, 
-            "That slot has already ended. Pick a future date/slot.", ephemeral=True
-        )
+        await channel.send(f"<@{payload.user_id}> that slot already ended.")
         return
 
+    user_id = str(payload.user_id)
     with db_lock:
         balance = get_balance(user_id)
         if balance < 1:
-            await reply(interaction, 
-                "You don't have any tokens. Redeem a code first with /redeem.", ephemeral=True
+            await channel.send(
+                f"<@{payload.user_id}> you don't have any tokens. Redeem a code first with /redeem."
             )
             return
 
-        # Prevent the same user double-booking the identical slot.
         dupe = conn.execute(
             "SELECT id FROM bookings WHERE discord_user_id = ? AND booking_date = ? AND slot = ? AND status != 'cancelled'",
-            (user_id, date, slot_key),
+            (user_id, prompt["date_str"], key),
         ).fetchone()
         if dupe:
-            await reply(interaction, 
-                "You've already booked that exact slot.", ephemeral=True
-            )
+            await channel.send(f"<@{payload.user_id}> you've already booked that slot.")
             return
 
-        conn.execute(
-            "UPDATE balances SET tokens = tokens - 1 WHERE discord_user_id = ?", (user_id,)
-        )
+        conn.execute("UPDATE balances SET tokens = tokens - 1 WHERE discord_user_id = ?", (user_id,))
         conn.execute(
             "INSERT INTO bookings (discord_user_id, booking_date, slot, start_ts, end_ts, status) "
             "VALUES (?, ?, ?, ?, ?, 'booked')",
-            (user_id, date, slot_key, start_dt.isoformat(), end_dt.isoformat()),
+            (user_id, prompt["date_str"], key, start_dt.isoformat(), end_dt.isoformat()),
         )
         conn.commit()
 
     joined_late = start_dt <= now
     timing_note = (
         "The slot has already started, so your channel will appear within a minute "
-        f"and still end at the scheduled time ({end_dt.strftime('%-I:%M%p')} Eastern) — "
-        "you won't get extra time for joining late."
+        "and still end at the scheduled time — no extra time for joining late."
         if joined_late else
-        "Your private voice channel will appear automatically when the slot starts, "
+        "Your voice channel will appear automatically when the slot starts, "
         "and close automatically when it ends."
     )
 
-    await reply(interaction, 
-        f"Booked! {date} {label} (Eastern). {timing_note}",
-        ephemeral=True,
-    )
+    await channel.send(f"✅ <@{payload.user_id}> booked {label} on {prompt['date_str']} (Eastern). {timing_note}")
+
+    try:
+        message = await channel.fetch_message(payload.message_id)
+        await message.clear_reactions()
+    except discord.HTTPException:
+        pass
 
 @client.tree.command(
     name="listslots",
