@@ -339,6 +339,11 @@ async def ensure_student_channels(guild: discord.Guild, member: discord.Member):
 def is_admin(interaction: discord.Interaction) -> bool:
     return interaction.user.guild_permissions.administrator
 
+def is_tutor_or_admin(interaction: discord.Interaction) -> bool:
+    if is_admin(interaction):
+        return True
+    return any(role.id == TUTOR_ROLE_ID for role in interaction.user.roles)
+
 def get_student_text_channel(discord_user_id: str):
     row = conn.execute(
         "SELECT text_channel_id FROM student_channels WHERE discord_user_id = ?",
@@ -559,54 +564,67 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if channel is None:
         return
 
-    _, label, start_dt, end_dt = option
-    now = datetime.datetime.now(TZ)
-
-    if end_dt <= now:
-        await channel.send(f"<@{payload.user_id}> that slot already ended.")
-        return
-
-    user_id = str(payload.user_id)
-    with db_lock:
-        balance = get_balance(user_id)
-        if balance < 1:
-            await channel.send(
-                f"<@{payload.user_id}> you don't have any tokens. Redeem a code first with /redeem."
-            )
-            return
-
-        dupe = conn.execute(
-            "SELECT id FROM bookings WHERE discord_user_id = ? AND booking_date = ? AND slot = ? AND status != 'cancelled'",
-            (user_id, prompt["date_str"], key),
-        ).fetchone()
-        if dupe:
-            await channel.send(f"<@{payload.user_id}> you've already booked that slot.")
-            return
-
-        conn.execute("UPDATE balances SET tokens = tokens - 1 WHERE discord_user_id = ?", (user_id,))
-        conn.execute(
-            "INSERT INTO bookings (discord_user_id, booking_date, slot, start_ts, end_ts, status) "
-            "VALUES (?, ?, ?, ?, ?, 'booked')",
-            (user_id, prompt["date_str"], key, start_dt.isoformat(), end_dt.isoformat()),
-        )
-        conn.commit()
-
-    joined_late = start_dt <= now
-    timing_note = (
-        "The slot has already started, so your channel will appear within a minute "
-        "and still end at the scheduled time — no extra time for joining late."
-        if joined_late else
-        "Your voice channel will appear automatically when the slot starts, "
-        "and close automatically when it ends."
-    )
-
-    await channel.send(f"✅ <@{payload.user_id}> booked {label} on {prompt['date_str']} (Eastern). {timing_note}")
-
     try:
         message = await channel.fetch_message(payload.message_id)
-        await message.clear_reactions()
     except discord.HTTPException:
-        pass
+        message = None
+
+    _, label, start_dt, end_dt = option
+    now = datetime.datetime.now(TZ)
+    user_id = str(payload.user_id)
+
+    if end_dt <= now:
+        result_text = f"⛔ <@{payload.user_id}> that slot already ended. This prompt is now closed."
+    else:
+        with db_lock:
+            balance = get_balance(user_id)
+            if balance < 1:
+                result_text = (
+                    f"⛔ <@{payload.user_id}> you don't have any tokens. "
+                    f"Redeem a code first with /redeem. This prompt is now closed."
+                )
+            else:
+                dupe = conn.execute(
+                    "SELECT id FROM bookings WHERE discord_user_id = ? AND booking_date = ? AND slot = ? AND status != 'cancelled'",
+                    (user_id, prompt["date_str"], key),
+                ).fetchone()
+                if dupe:
+                    result_text = (
+                        f"⛔ <@{payload.user_id}> you've already booked that slot. This prompt is now closed."
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE balances SET tokens = tokens - 1 WHERE discord_user_id = ?", (user_id,)
+                    )
+                    conn.execute(
+                        "INSERT INTO bookings (discord_user_id, booking_date, slot, start_ts, end_ts, status) "
+                        "VALUES (?, ?, ?, ?, ?, 'booked')",
+                        (user_id, prompt["date_str"], key, start_dt.isoformat(), end_dt.isoformat()),
+                    )
+                    conn.commit()
+
+                    joined_late = start_dt <= now
+                    timing_note = (
+                        "The slot already started, so your channel will appear within a minute "
+                        "and still end at the scheduled time — no extra time for joining late."
+                        if joined_late else
+                        "Your voice channel will appear automatically when the slot starts, "
+                        "and close automatically when it ends."
+                    )
+                    result_text = (
+                        f"✅ <@{payload.user_id}> booked {label} on {prompt['date_str']} (Eastern). {timing_note}"
+                    )
+
+    # Whatever happened, this prompt is done: lock the message down so it
+    # can't be reacted to again for a different time.
+    if message is not None:
+        try:
+            await message.edit(content=result_text)
+            await message.clear_reactions()
+        except discord.HTTPException:
+            await channel.send(result_text)
+    else:
+        await channel.send(result_text)
 
 @client.tree.command(
     name="listslots",
@@ -761,7 +779,7 @@ async def removebalance(interaction: discord.Interaction, user: discord.Member, 
 )
 async def exportbalances(interaction: discord.Interaction):
     if not is_admin(interaction):
-        await reply(interaction, "Admins only.", ephemeral=True)
+        await admin_reply(interaction, "Admins only.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -787,6 +805,24 @@ async def exportbalances(interaction: discord.Interaction):
     await interaction.followup.send(
         "Current token balances:",
         file=discord.File(file_path, filename="balances.xlsx"),
+        ephemeral=True,
+    )
+
+@client.tree.command(
+    name="createroom",
+    description="[Tutor] Recreate a student's private room if it was deleted",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(user="The student to create/restore a room for")
+async def createroom(interaction: discord.Interaction, user: discord.Member):
+    if not is_tutor_or_admin(interaction):
+        await admin_reply(interaction, "Tutors/admins only.", ephemeral=True)
+        return
+
+    category, text_channel = await ensure_student_channels(interaction.guild, user)
+    await admin_reply(
+        interaction,
+        f"Room ready for {user.mention}: {text_channel.mention}",
         ephemeral=True,
     )
 
