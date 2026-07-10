@@ -513,7 +513,12 @@ async def book(interaction: discord.Interaction, date: str):
         options = []
         for key, (start_h, end_h, label) in sorted(slots.items()):
             start_dt = datetime.datetime.combine(candidate, datetime.time(hour=start_h), tzinfo=TZ)
-            end_dt = datetime.datetime.combine(candidate, datetime.time(hour=end_h), tzinfo=TZ)
+            if end_h == 24:
+                # Hour 24 means midnight of the next day — time() only
+                # accepts 0-23, so roll over explicitly.
+                end_dt = datetime.datetime.combine(candidate, datetime.time(hour=0), tzinfo=TZ) + datetime.timedelta(days=1)
+            else:
+                end_dt = datetime.datetime.combine(candidate, datetime.time(hour=end_h), tzinfo=TZ)
             if end_dt <= now:
                 continue  # fully in the past for this date, can't be booked
             options.append((key, label, start_dt, end_dt))
