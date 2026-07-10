@@ -76,6 +76,13 @@ DEFAULT_SLOTS = {
 
 def db_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # The Flask webhook thread and the Discord bot's asyncio thread both hit
+    # this same connection. WAL mode lets reads and writes coexist better,
+    # and busy_timeout makes SQLite wait/retry briefly on a lock instead of
+    # raising "database is locked" immediately, which was causing some
+    # slash commands to fail silently before they could reply to Discord.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS codes (
             code TEXT PRIMARY KEY,
