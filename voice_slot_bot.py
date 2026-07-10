@@ -834,6 +834,127 @@ async def createroom(interaction: discord.Interaction, user: discord.Member):
     )
 
 @client.tree.command(
+    name="viewbookings",
+    description="[Tutor] List a student's upcoming bookings with their IDs",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(user="The student to look up")
+async def viewbookings(interaction: discord.Interaction, user: discord.Member):
+    if not is_tutor_or_admin(interaction):
+        await admin_reply(interaction, "Tutors/admins only.", ephemeral=True)
+        return
+
+    rows = conn.execute(
+        "SELECT id, booking_date, slot, status, start_ts FROM bookings "
+        "WHERE discord_user_id = ? AND status != 'cancelled' ORDER BY start_ts",
+        (str(user.id),),
+    ).fetchall()
+
+    if not rows:
+        await admin_reply(interaction, f"{user.mention} has no bookings.", ephemeral=True)
+        return
+
+    now = datetime.datetime.now(TZ)
+    lines = []
+    for booking_id, booking_date, slot, status, start_ts in rows:
+        start_dt = datetime.datetime.fromisoformat(start_ts)
+        started_note = " (in progress/past)" if start_dt <= now else ""
+        lines.append(f"ID {booking_id} — {booking_date} {slot} ({status}){started_note}")
+
+    await admin_reply(
+        interaction,
+        f"Bookings for {user.mention}:\n" + "\n".join(lines),
+        ephemeral=True,
+    )
+
+@client.tree.command(
+    name="cancelbooking",
+    description="[Tutor] Cancel a student's booking, only if it hasn't started yet",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(booking_id="The booking ID from /viewbookings")
+async def cancelbooking(interaction: discord.Interaction, booking_id: int):
+    if not is_tutor_or_admin(interaction):
+        await admin_reply(interaction, "Tutors/admins only.", ephemeral=True)
+        return
+
+    with db_lock:
+        row = conn.execute(
+            "SELECT discord_user_id, booking_date, slot, start_ts, status FROM bookings WHERE id = ?",
+            (booking_id,),
+        ).fetchone()
+
+        if row is None:
+            await admin_reply(interaction, "No booking found with that ID.", ephemeral=True)
+            return
+
+        user_id, booking_date, slot, start_ts, status = row
+
+        if status != "booked":
+            await admin_reply(interaction, f"That booking is already '{status}', nothing to cancel.", ephemeral=True)
+            return
+
+        start_dt = datetime.datetime.fromisoformat(start_ts)
+        now = datetime.datetime.now(TZ)
+        if start_dt <= now:
+            await admin_reply(
+                interaction,
+                "That booking has already started, so it can't be cancelled this way.",
+                ephemeral=True,
+            )
+            return
+
+        conn.execute("UPDATE bookings SET status = 'cancelled' WHERE id = ?", (booking_id,))
+        conn.execute(
+            "INSERT INTO balances (discord_user_id, tokens) VALUES (?, 1) "
+            "ON CONFLICT(discord_user_id) DO UPDATE SET tokens = tokens + 1",
+            (user_id,),
+        )
+        conn.commit()
+
+    await admin_reply(
+        interaction,
+        f"Cancelled booking {booking_id} ({booking_date} {slot}) and refunded 1 token to <@{user_id}>.",
+        ephemeral=True,
+    )
+
+@client.tree.command(
+    name="startroom",
+    description="[Tutor] Start a room for a student right now for N minutes",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(user="The student to start a room for", minutes="How many minutes the room should stay open")
+async def startroom(interaction: discord.Interaction, user: discord.Member, minutes: int):
+    if not is_tutor_or_admin(interaction):
+        await admin_reply(interaction, "Tutors/admins only.", ephemeral=True)
+        return
+    if minutes <= 0:
+        await admin_reply(interaction, "Minutes must be positive.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    now = datetime.datetime.now(TZ)
+    end_dt = now + datetime.timedelta(minutes=minutes)
+
+    with db_lock:
+        cur = conn.execute(
+            "INSERT INTO bookings (discord_user_id, booking_date, slot, start_ts, end_ts, status) "
+            "VALUES (?, ?, ?, ?, ?, 'booked')",
+            (str(user.id), now.date().isoformat(), "manual", now.isoformat(), end_dt.isoformat()),
+        )
+        conn.commit()
+        booking_id = cur.lastrowid
+
+    voice_channel = await create_voice_room_for_booking(interaction.guild, user, booking_id)
+
+    await interaction.followup.send(
+        f"Started a {minutes}-minute room for {user.mention}: {voice_channel.mention}. "
+        f"It will close automatically at {end_dt.strftime('%-I:%M%p')} Eastern.",
+        ephemeral=True,
+    )
+
+@client.tree.command(
     name="mybookings",
     description="Show your upcoming bookings and token balance",
     guild=discord.Object(id=GUILD_ID),
@@ -872,6 +993,45 @@ async def checkbalance(interaction: discord.Interaction):
 # Scheduler: create channels when slots start, delete when they end
 # ---------------------------------------------------------------------------
 
+async def create_voice_room_for_booking(guild: discord.Guild, member: discord.Member, booking_id: int):
+    """Creates the voice channel for a booking that's ready to start, updates
+    the booking's channel_id, and notifies the student. Shared by the
+    scheduler (automatic slot starts) and /startroom (manual instant start)."""
+    category, text_channel = await ensure_student_channels(guild, member)
+
+    tutor_role = guild.get_role(TUTOR_ROLE_ID)
+    voice_overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
+        member: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True),
+    }
+    if tutor_role is not None:
+        voice_overwrites[tutor_role] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
+
+    voice_channel = await guild.create_voice_channel(
+        name="voice",
+        overwrites=voice_overwrites,
+        category=category,
+    )
+
+    with db_lock:
+        conn.execute(
+            "UPDATE bookings SET channel_id = ? WHERE id = ?",
+            (str(voice_channel.id), booking_id),
+        )
+        conn.commit()
+
+    await text_channel.send(
+        f"{member.mention} your slot has started — join your voice room: {voice_channel.mention}"
+    )
+
+    try:
+        await member.send(f"Your slot has started! Join your voice room: {voice_channel.mention}")
+    except discord.Forbidden:
+        pass  # user has DMs disabled
+
+    return voice_channel
+
 @tasks.loop(seconds=60)
 async def slot_scheduler():
     guild = client.get_guild(GUILD_ID)
@@ -892,39 +1052,7 @@ async def slot_scheduler():
             member = guild.get_member(int(user_id))
             if member is None:
                 continue
-
-            category, text_channel = await ensure_student_channels(guild, member)
-
-            tutor_role = guild.get_role(TUTOR_ROLE_ID)
-            voice_overwrites = {
-                guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False),
-                member: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True),
-                guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True),
-            }
-            if tutor_role is not None:
-                voice_overwrites[tutor_role] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
-
-            voice_channel = await guild.create_voice_channel(
-                name="voice",
-                overwrites=voice_overwrites,
-                category=category,
-            )
-
-            with db_lock:
-                conn.execute(
-                    "UPDATE bookings SET channel_id = ? WHERE id = ?",
-                    (str(voice_channel.id), booking_id),
-                )
-                conn.commit()
-
-            await text_channel.send(
-                f"{member.mention} your slot has started — join your voice room: {voice_channel.mention}"
-            )
-
-            try:
-                await member.send(f"Your slot has started! Join your voice room: {voice_channel.mention}")
-            except discord.Forbidden:
-                pass  # user has DMs disabled
+            await create_voice_room_for_booking(guild, member, booking_id)
 
     # End slots that are over: delete only the voice channel, mark completed.
     # The student's text channel and category are permanent and untouched.
