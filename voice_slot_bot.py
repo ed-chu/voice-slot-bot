@@ -116,9 +116,14 @@ def db_conn():
             start_ts TEXT,
             end_ts TEXT,
             channel_id TEXT,
-            status TEXT DEFAULT 'booked'
+            status TEXT DEFAULT 'booked',
+            checkout_reminder_sent INTEGER DEFAULT 0
         )
     """)
+    booking_cols = [row[1] for row in conn.execute("PRAGMA table_info(bookings)").fetchall()]
+    if "checkout_reminder_sent" not in booking_cols:
+        conn.execute("ALTER TABLE bookings ADD COLUMN checkout_reminder_sent INTEGER DEFAULT 0")
+        conn.commit()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS student_channels (
             discord_user_id TEXT PRIMARY KEY,
@@ -457,91 +462,105 @@ def parse_month_day(date_str: str):
 )
 @app_commands.describe(date="Date without year, e.g. 07-15, 7/15, or 'July 15' — nearest upcoming occurrence is used")
 async def book(interaction: discord.Interaction, date: str):
-    user_id = str(interaction.user.id)
-
-    # Reactions can't be added to ephemeral messages, so this only works
-    # inside the student's own private channel.
-    text_channel_id = get_student_text_channel(user_id)
-    in_own_channel = (
-        text_channel_id is not None
-        and interaction.channel is not None
-        and str(interaction.channel.id) == text_channel_id
-    )
-    if not in_own_channel:
-        await interaction.response.send_message(
-            "Please run /book inside your own private channel.", ephemeral=True
-        )
-        return
-
-    parsed = parse_month_day(date)
-    if parsed is None:
-        await reply(interaction, "Couldn't understand that date. Try 07-15, 7/15, or 'July 15'.")
-        return
-
-    month, day = parsed
-    now = datetime.datetime.now(TZ)
-    today = now.date()
+    # Defer immediately so Discord always gets an ack within its 3-second
+    # window, regardless of how long the logic below takes or whether it
+    # errors. Everything after this uses followup.send instead of
+    # response.send_message.
+    await interaction.response.defer()
 
     try:
-        candidate = datetime.date(today.year, month, day)
-    except ValueError:
-        await reply(interaction, "That's not a valid date.")
-        return
+        user_id = str(interaction.user.id)
 
-    if candidate < today:
-        try:
-            candidate = datetime.date(today.year + 1, month, day)
-        except ValueError:
-            await reply(interaction, "That date doesn't exist next year either (e.g. Feb 29).")
+        # Reactions can't be added to ephemeral messages, so this only works
+        # inside the student's own private channel.
+        text_channel_id = get_student_text_channel(user_id)
+        in_own_channel = (
+            text_channel_id is not None
+            and interaction.channel is not None
+            and str(interaction.channel.id) == text_channel_id
+        )
+        if not in_own_channel:
+            await interaction.followup.send(
+                "Please run /book inside your own private channel.", ephemeral=True
+            )
             return
 
-    date_str = candidate.isoformat()
-    slots = get_slots()
+        parsed = parse_month_day(date)
+        if parsed is None:
+            await interaction.followup.send("Couldn't understand that date. Try 07-15, 7/15, or 'July 15'.")
+            return
 
-    options = []
-    for key, (start_h, end_h, label) in sorted(slots.items()):
-        start_dt = datetime.datetime.combine(candidate, datetime.time(hour=start_h), tzinfo=TZ)
-        end_dt = datetime.datetime.combine(candidate, datetime.time(hour=end_h), tzinfo=TZ)
-        if end_dt <= now:
-            continue  # fully in the past for this date, can't be booked
-        options.append((key, label, start_dt, end_dt))
+        month, day = parsed
+        now = datetime.datetime.now(TZ)
+        today = now.date()
 
-    if not options:
-        await reply(interaction, f"No bookable slots left for {date_str}.")
-        return
-
-    if len(options) > len(NUMBER_EMOJIS):
-        options = options[:len(NUMBER_EMOJIS)]
-
-    balance = get_balance(user_id)
-    lines = []
-    emoji_map = {}
-    for i, (key, label, start_dt, end_dt) in enumerate(options):
-        emoji = NUMBER_EMOJIS[i]
-        emoji_map[emoji] = key
-        started_note = " (already started)" if start_dt <= now else ""
-        lines.append(f"{emoji} {label}{started_note}")
-
-    content = (
-        f"Available slots for **{date_str}**:\n" + "\n".join(lines) +
-        f"\n\nReact with the emoji to book (costs 1 token — you have {balance})."
-    )
-
-    await interaction.response.send_message(content)
-    message = await interaction.original_response()
-
-    for emoji in emoji_map:
         try:
-            await message.add_reaction(emoji)
+            candidate = datetime.date(today.year, month, day)
+        except ValueError:
+            await interaction.followup.send("That's not a valid date.")
+            return
+
+        if candidate < today:
+            try:
+                candidate = datetime.date(today.year + 1, month, day)
+            except ValueError:
+                await interaction.followup.send("That date doesn't exist next year either (e.g. Feb 29).")
+                return
+
+        date_str = candidate.isoformat()
+        slots = get_slots()
+
+        options = []
+        for key, (start_h, end_h, label) in sorted(slots.items()):
+            start_dt = datetime.datetime.combine(candidate, datetime.time(hour=start_h), tzinfo=TZ)
+            end_dt = datetime.datetime.combine(candidate, datetime.time(hour=end_h), tzinfo=TZ)
+            if end_dt <= now:
+                continue  # fully in the past for this date, can't be booked
+            options.append((key, label, start_dt, end_dt))
+
+        if not options:
+            await interaction.followup.send(f"No bookable slots left for {date_str}.")
+            return
+
+        if len(options) > len(NUMBER_EMOJIS):
+            options = options[:len(NUMBER_EMOJIS)]
+
+        balance = get_balance(user_id)
+        lines = []
+        emoji_map = {}
+        for i, (key, label, start_dt, end_dt) in enumerate(options):
+            emoji = NUMBER_EMOJIS[i]
+            emoji_map[emoji] = key
+            started_note = " (already started)" if start_dt <= now else ""
+            lines.append(f"{emoji} {label}{started_note}")
+
+        content = (
+            f"Available slots for **{date_str}**:\n" + "\n".join(lines) +
+            f"\n\nReact with the emoji to book (costs 1 token — you have {balance})."
+        )
+
+        message = await interaction.followup.send(content, wait=True)
+
+        for emoji in emoji_map:
+            try:
+                await message.add_reaction(emoji)
+            except discord.HTTPException:
+                pass
+
+        pending_book_prompts[message.id] = {
+            "user_id": interaction.user.id,
+            "date_str": date_str,
+            "options": options,
+            "emoji_map": emoji_map,
+        }
+    except Exception as e:
+        print(f"[book] unexpected error for user {interaction.user.id}: {e}")
+        try:
+            await interaction.followup.send(
+                "Something went wrong processing that — please try again.", ephemeral=True
+            )
         except discord.HTTPException:
             pass
-
-    pending_book_prompts[message.id] = {
-        "user_id": interaction.user.id,
-        "date_str": date_str,
-        "options": options,
-        "emoji_map": emoji_map,
-    }
 
 @client.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
@@ -946,7 +965,7 @@ async def startroom(interaction: discord.Interaction, user: discord.Member, minu
         conn.commit()
         booking_id = cur.lastrowid
 
-    voice_channel = await create_voice_room_for_booking(interaction.guild, user, booking_id)
+    voice_channel = await create_voice_room_for_booking(interaction.guild, user, booking_id, end_dt)
 
     await interaction.followup.send(
         f"Started a {minutes}-minute room for {user.mention}: {voice_channel.mention}. "
@@ -993,9 +1012,9 @@ async def checkbalance(interaction: discord.Interaction):
 # Scheduler: create channels when slots start, delete when they end
 # ---------------------------------------------------------------------------
 
-async def create_voice_room_for_booking(guild: discord.Guild, member: discord.Member, booking_id: int):
+async def create_voice_room_for_booking(guild: discord.Guild, member: discord.Member, booking_id: int, end_dt: datetime.datetime):
     """Creates the voice channel for a booking that's ready to start, updates
-    the booking's channel_id, and notifies the student. Shared by the
+    the booking's channel_id, and sends check-in instructions. Shared by the
     scheduler (automatic slot starts) and /startroom (manual instant start)."""
     category, text_channel = await ensure_student_channels(guild, member)
 
@@ -1021,12 +1040,17 @@ async def create_voice_room_for_booking(guild: discord.Guild, member: discord.Me
         )
         conn.commit()
 
-    await text_channel.send(
-        f"{member.mention} your slot has started — join your voice room: {voice_channel.mention}"
+    end_time_str = end_dt.strftime("%-I:%M%p")
+    checkin_message = (
+        f"✅ **Check-in complete, {member.mention}!** Your room is ready — join your voice room: "
+        f"{voice_channel.mention}\nYour session ends at {end_time_str} Eastern. "
+        f"You'll get a check-out reminder 5 minutes before it ends."
     )
 
+    await text_channel.send(checkin_message)
+
     try:
-        await member.send(f"Your slot has started! Join your voice room: {voice_channel.mention}")
+        await member.send(checkin_message)
     except discord.Forbidden:
         pass  # user has DMs disabled
 
@@ -1052,7 +1076,44 @@ async def slot_scheduler():
             member = guild.get_member(int(user_id))
             if member is None:
                 continue
-            await create_voice_room_for_booking(guild, member, booking_id)
+            end_dt = datetime.datetime.fromisoformat(end_ts)
+            await create_voice_room_for_booking(guild, member, booking_id, end_dt)
+
+    # Check-out reminders: 5 minutes before a booking ends, send a one-time
+    # heads-up so the student knows to wrap up.
+    to_remind = conn.execute(
+        "SELECT id, discord_user_id, end_ts FROM bookings "
+        "WHERE status = 'booked' AND channel_id IS NOT NULL AND checkout_reminder_sent = 0"
+    ).fetchall()
+
+    for booking_id, user_id, end_ts in to_remind:
+        end_dt = datetime.datetime.fromisoformat(end_ts)
+        minutes_left = (end_dt - now).total_seconds() / 60
+        if 0 < minutes_left <= 5:
+            member = guild.get_member(int(user_id))
+            text_channel_id = get_student_text_channel(user_id)
+            if member is not None and text_channel_id is not None:
+                text_channel = guild.get_channel(int(text_channel_id))
+                if text_channel is not None:
+                    checkout_message = (
+                        f"⏰ **Check-out reminder, {member.mention}:** your session ends in about "
+                        f"5 minutes, at {end_dt.strftime('%-I:%M%p')} Eastern. Please wrap up and "
+                        f"leave the voice channel when you're done — it will close automatically."
+                    )
+                    try:
+                        await text_channel.send(checkout_message)
+                    except discord.HTTPException:
+                        pass
+                    try:
+                        await member.send(checkout_message)
+                    except discord.Forbidden:
+                        pass
+
+            with db_lock:
+                conn.execute(
+                    "UPDATE bookings SET checkout_reminder_sent = 1 WHERE id = ?", (booking_id,)
+                )
+                conn.commit()
 
     # End slots that are over: delete only the voice channel, mark completed.
     # The student's text channel and category are permanent and untouched.
