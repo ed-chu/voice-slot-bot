@@ -1054,11 +1054,6 @@ async def create_voice_room_for_booking(guild: discord.Guild, member: discord.Me
 
     await text_channel.send(checkin_message)
 
-    try:
-        await member.send(checkin_message)
-    except discord.Forbidden:
-        pass  # user has DMs disabled
-
     return voice_channel
 
 @tasks.loop(seconds=60)
@@ -1108,10 +1103,6 @@ async def slot_scheduler():
                     try:
                         await text_channel.send(checkout_message)
                     except discord.HTTPException:
-                        pass
-                    try:
-                        await member.send(checkout_message)
-                    except discord.Forbidden:
                         pass
 
             with db_lock:
