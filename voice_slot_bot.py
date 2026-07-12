@@ -59,6 +59,10 @@ TOKEN_PRODUCT_ID = os.environ["TOKEN_PRODUCT_ID"]
 TUTOR_ROLE_ID = int(os.environ["TUTOR_ROLE_ID"])
 
 TZ = ZoneInfo("America/Toronto")
+
+# TODO: replace with your real sign-in link once you have one.
+SIGNIN_LINK = os.environ.get("SIGNIN_LINK", "https://example.com/sign-in-placeholder")
+FEEDBACK_FORM_LINK = "https://docs.google.com/forms/d/e/1FAIpQLSdpe7V3wpKN_k_l7BzQlmSqLBsnckgBz6BgkOaPW1RMjvpjpg/viewform?usp=sharing&ouid=100164859931306672567"
 DB_PATH = os.environ.get("DB_PATH", "slots.db")
 
 # Default daily slots, seeded into the DB on first run. After that, slots
@@ -117,12 +121,16 @@ def db_conn():
             end_ts TEXT,
             channel_id TEXT,
             status TEXT DEFAULT 'booked',
-            checkout_reminder_sent INTEGER DEFAULT 0
+            checkout_reminder_sent INTEGER DEFAULT 0,
+            signin_reminder_sent INTEGER DEFAULT 0
         )
     """)
     booking_cols = [row[1] for row in conn.execute("PRAGMA table_info(bookings)").fetchall()]
     if "checkout_reminder_sent" not in booking_cols:
         conn.execute("ALTER TABLE bookings ADD COLUMN checkout_reminder_sent INTEGER DEFAULT 0")
+        conn.commit()
+    if "signin_reminder_sent" not in booking_cols:
+        conn.execute("ALTER TABLE bookings ADD COLUMN signin_reminder_sent INTEGER DEFAULT 0")
         conn.commit()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS student_channels (
@@ -1047,9 +1055,10 @@ async def create_voice_room_for_booking(guild: discord.Guild, member: discord.Me
 
     end_time_str = end_dt.strftime("%-I:%M%p")
     checkin_message = (
-        f"✅ **Check-in complete, {member.mention}!** Your room is ready — join your voice room: "
-        f"{voice_channel.mention}\nYour session ends at {end_time_str} Eastern. "
-        f"You'll get a check-out reminder 5 minutes before it ends."
+        f"✅ **Your session has started, {member.mention}!** Join your voice room: {voice_channel.mention}\n"
+        f"If you haven't signed in yet, please do so here: {SIGNIN_LINK}\n"
+        f"Please turn on your camera for the session.\n"
+        f"Your session ends at {end_time_str} Eastern — you'll get a check-out reminder 5 minutes before it ends."
     )
 
     await text_channel.send(checkin_message)
@@ -1079,6 +1088,39 @@ async def slot_scheduler():
             end_dt = datetime.datetime.fromisoformat(end_ts)
             await create_voice_room_for_booking(guild, member, booking_id, end_dt)
 
+    # Sign-in reminders: 3 minutes before a booking starts, give a heads-up
+    # in the student's permanent channel (the voice room doesn't exist yet).
+    to_signin = conn.execute(
+        "SELECT id, discord_user_id, start_ts FROM bookings "
+        "WHERE status = 'booked' AND signin_reminder_sent = 0"
+    ).fetchall()
+
+    for booking_id, user_id, start_ts in to_signin:
+        start_dt = datetime.datetime.fromisoformat(start_ts)
+        minutes_until = (start_dt - now).total_seconds() / 60
+        if 0 < minutes_until <= 3:
+            member = guild.get_member(int(user_id))
+            text_channel_id = get_student_text_channel(user_id)
+            if member is not None and text_channel_id is not None:
+                text_channel = guild.get_channel(int(text_channel_id))
+                if text_channel is not None:
+                    signin_message = (
+                        f"🔔 **Heads up, {member.mention}** — your session starts in about 3 minutes, "
+                        f"at {start_dt.strftime('%-I:%M%p')} Eastern.\n"
+                        f"Please sign in here: {SIGNIN_LINK}\n"
+                        f"Find a quiet place to work before your session begins."
+                    )
+                    try:
+                        await text_channel.send(signin_message)
+                    except discord.HTTPException:
+                        pass
+
+            with db_lock:
+                conn.execute(
+                    "UPDATE bookings SET signin_reminder_sent = 1 WHERE id = ?", (booking_id,)
+                )
+                conn.commit()
+
     # Check-out reminders: 5 minutes before a booking ends, send a one-time
     # heads-up so the student knows to wrap up.
     to_remind = conn.execute(
@@ -1098,7 +1140,8 @@ async def slot_scheduler():
                     checkout_message = (
                         f"⏰ **Check-out reminder, {member.mention}:** your session ends in about "
                         f"5 minutes, at {end_dt.strftime('%-I:%M%p')} Eastern. Please wrap up and "
-                        f"leave the voice channel when you're done — it will close automatically."
+                        f"leave the voice channel when you're done — it will close automatically.\n\n"
+                        f"Before you go, please fill out this quick feedback form: {FEEDBACK_FORM_LINK}"
                     )
                     try:
                         await text_channel.send(checkout_message)
