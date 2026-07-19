@@ -65,14 +65,8 @@ SIGNIN_LINK = os.environ.get("SIGNIN_LINK", "https://example.com/sign-in-placeho
 FEEDBACK_FORM_LINK = "https://docs.google.com/forms/d/e/1FAIpQLSdpe7V3wpKN_k_l7BzQlmSqLBsnckgBz6BgkOaPW1RMjvpjpg/viewform?usp=sharing&ouid=100164859931306672567"
 DB_PATH = os.environ.get("DB_PATH", "slots.db")
 
-# Default daily slots, seeded into the DB on first run. After that, slots
-# live in the slot_definitions table and admins manage them with
-# /addslot, /removeslot, /listslots.
-DEFAULT_SLOTS = {
-    "9-12": (9, 12, "9am - 12pm"),
-    "12-3": (12, 15, "12pm - 3pm"),
-    "3-6": (15, 18, "3pm - 6pm"),
-}
+SESSION_HOURS = 3  # every booking is a fixed 3-hour block
+MIN_ADVANCE_HOURS = 24  # bookings must be made at least this far ahead
 
 # ---------------------------------------------------------------------------
 # Database setup
@@ -139,24 +133,7 @@ def db_conn():
             text_channel_id TEXT
         )
     """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS slot_definitions (
-            slot_key TEXT PRIMARY KEY,
-            start_hour INTEGER,
-            end_hour INTEGER,
-            label TEXT
-        )
-    """)
     conn.commit()
-
-    existing = conn.execute("SELECT COUNT(*) FROM slot_definitions").fetchone()[0]
-    if existing == 0:
-        for key, (start_h, end_h, label) in DEFAULT_SLOTS.items():
-            conn.execute(
-                "INSERT INTO slot_definitions (slot_key, start_hour, end_hour, label) VALUES (?, ?, ?, ?)",
-                (key, start_h, end_h, label),
-            )
-        conn.commit()
 
     return conn
 
@@ -281,11 +258,6 @@ def get_balance(discord_user_id: str) -> int:
         "SELECT tokens FROM balances WHERE discord_user_id = ?", (discord_user_id,)
     ).fetchone()
     return row[0] if row else 0
-
-def get_slots() -> dict:
-    """Returns {slot_key: (start_hour, end_hour, label)} from the DB."""
-    rows = conn.execute("SELECT slot_key, start_hour, end_hour, label FROM slot_definitions").fetchall()
-    return {key: (start_h, end_h, label) for key, start_h, end_h, label in rows}
 
 async def ensure_student_channels(guild: discord.Guild, member: discord.Member):
     """Returns (category, text_channel), creating them if this student doesn't have them yet."""
@@ -443,13 +415,6 @@ async def redeem(interaction: discord.Interaction, code: str):
         ephemeral=True,
     )
 
-NUMBER_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-
-# In-memory map of message_id -> pending booking prompt details. Lost on
-# restart, which just means any prompt sent before a restart stops working —
-# the student can simply run /book again.
-pending_book_prompts: dict = {}
-
 def parse_month_day(date_str: str):
     """Parses a date string with no year, e.g. '07-15', '7/15', 'July 15',
     'Jul 15'. Returns (month, day) or None if it doesn't match anything."""
@@ -463,24 +428,37 @@ def parse_month_day(date_str: str):
             continue
     return None
 
+def parse_time_str(time_str: str):
+    """Parses a start time, e.g. '2pm', '2:30pm', '14:00', '14'. Returns
+    (hour, minute) or None if it doesn't match anything."""
+    time_str = time_str.strip().upper().replace(" ", "")
+    formats = ["%I:%M%p", "%I%p", "%H:%M", "%H"]
+    for fmt in formats:
+        try:
+            parsed = datetime.datetime.strptime(time_str, fmt)
+            return parsed.hour, parsed.minute
+        except ValueError:
+            continue
+    return None
+
 @client.tree.command(
     name="book",
-    description="See bookable slots for a date and react to book one",
+    description=f"Book a {SESSION_HOURS}-hour study session at any time, at least {MIN_ADVANCE_HOURS}h in advance",
     guild=discord.Object(id=GUILD_ID),
 )
-@app_commands.describe(date="Date without year, e.g. 07-15, 7/15, or 'July 15' — nearest upcoming occurrence is used")
-async def book(interaction: discord.Interaction, date: str):
+@app_commands.describe(
+    date="Date without year, e.g. 07-15, 7/15, or 'July 15' — nearest upcoming occurrence is used",
+    time="Start time, e.g. 2pm, 2:30pm, or 14:00",
+)
+async def book(interaction: discord.Interaction, date: str, time: str):
     # Defer immediately so Discord always gets an ack within its 3-second
     # window, regardless of how long the logic below takes or whether it
-    # errors. Everything after this uses followup.send instead of
-    # response.send_message.
+    # errors.
     await interaction.response.defer()
 
     try:
         user_id = str(interaction.user.id)
 
-        # Reactions can't be added to ephemeral messages, so this only works
-        # inside the student's own private channel.
         text_channel_id = get_student_text_channel(user_id)
         in_own_channel = (
             text_channel_id is not None
@@ -493,79 +471,86 @@ async def book(interaction: discord.Interaction, date: str):
             )
             return
 
-        parsed = parse_month_day(date)
-        if parsed is None:
-            await interaction.followup.send("Couldn't understand that date. Try 07-15, 7/15, or 'July 15'.")
+        parsed_date = parse_month_day(date)
+        if parsed_date is None:
+            await interaction.followup.send(
+                "Couldn't understand that date. Try 07-15, 7/15, or 'July 15'.", ephemeral=True
+            )
             return
 
-        month, day = parsed
+        parsed_time = parse_time_str(time)
+        if parsed_time is None:
+            await interaction.followup.send(
+                "Couldn't understand that time. Try 2pm, 2:30pm, or 14:00.", ephemeral=True
+            )
+            return
+
+        month, day = parsed_date
+        hour, minute = parsed_time
         now = datetime.datetime.now(TZ)
         today = now.date()
 
         try:
-            candidate = datetime.date(today.year, month, day)
+            candidate_date = datetime.date(today.year, month, day)
         except ValueError:
-            await interaction.followup.send("That's not a valid date.")
+            await interaction.followup.send("That's not a valid date.", ephemeral=True)
             return
 
-        if candidate < today:
+        start_dt = datetime.datetime.combine(candidate_date, datetime.time(hour=hour, minute=minute), tzinfo=TZ)
+        if start_dt < now:
             try:
-                candidate = datetime.date(today.year + 1, month, day)
+                candidate_date = datetime.date(today.year + 1, month, day)
             except ValueError:
-                await interaction.followup.send("That date doesn't exist next year either (e.g. Feb 29).")
+                await interaction.followup.send(
+                    "That date doesn't exist next year either (e.g. Feb 29).", ephemeral=True
+                )
+                return
+            start_dt = datetime.datetime.combine(candidate_date, datetime.time(hour=hour, minute=minute), tzinfo=TZ)
+
+        end_dt = start_dt + datetime.timedelta(hours=SESSION_HOURS)
+
+        if start_dt - now < datetime.timedelta(hours=MIN_ADVANCE_HOURS):
+            await interaction.followup.send(
+                f"Sessions must be booked at least {MIN_ADVANCE_HOURS} hours in advance. "
+                f"The earliest you can book is {(now + datetime.timedelta(hours=MIN_ADVANCE_HOURS)).strftime('%b %-d, %-I:%M%p')} Eastern.",
+                ephemeral=True,
+            )
+            return
+
+        with db_lock:
+            balance = get_balance(user_id)
+            if balance < 1:
+                await interaction.followup.send(
+                    "You don't have any tokens. Redeem a code first with /redeem.", ephemeral=True
+                )
                 return
 
-        date_str = candidate.isoformat()
-        slots = get_slots()
+            # Prevent this student from booking two overlapping sessions.
+            overlap = conn.execute(
+                "SELECT id FROM bookings WHERE discord_user_id = ? AND status = 'booked' "
+                "AND start_ts < ? AND end_ts > ?",
+                (user_id, end_dt.isoformat(), start_dt.isoformat()),
+            ).fetchone()
+            if overlap:
+                await interaction.followup.send(
+                    "You already have a session that overlaps this time.", ephemeral=True
+                )
+                return
 
-        options = []
-        for key, (start_h, end_h, label) in sorted(slots.items()):
-            start_dt = datetime.datetime.combine(candidate, datetime.time(hour=start_h), tzinfo=TZ)
-            if end_h == 24:
-                # Hour 24 means midnight of the next day — time() only
-                # accepts 0-23, so roll over explicitly.
-                end_dt = datetime.datetime.combine(candidate, datetime.time(hour=0), tzinfo=TZ) + datetime.timedelta(days=1)
-            else:
-                end_dt = datetime.datetime.combine(candidate, datetime.time(hour=end_h), tzinfo=TZ)
-            if end_dt <= now:
-                continue  # fully in the past for this date, can't be booked
-            options.append((key, label, start_dt, end_dt))
+            conn.execute("UPDATE balances SET tokens = tokens - 1 WHERE discord_user_id = ?", (user_id,))
+            label = f"{start_dt.strftime('%-I:%M%p')} - {end_dt.strftime('%-I:%M%p')}"
+            conn.execute(
+                "INSERT INTO bookings (discord_user_id, booking_date, slot, start_ts, end_ts, status) "
+                "VALUES (?, ?, ?, ?, ?, 'booked')",
+                (user_id, start_dt.date().isoformat(), label, start_dt.isoformat(), end_dt.isoformat()),
+            )
+            conn.commit()
 
-        if not options:
-            await interaction.followup.send(f"No bookable slots left for {date_str}.")
-            return
-
-        if len(options) > len(NUMBER_EMOJIS):
-            options = options[:len(NUMBER_EMOJIS)]
-
-        balance = get_balance(user_id)
-        lines = []
-        emoji_map = {}
-        for i, (key, label, start_dt, end_dt) in enumerate(options):
-            emoji = NUMBER_EMOJIS[i]
-            emoji_map[emoji] = key
-            started_note = " (already started)" if start_dt <= now else ""
-            lines.append(f"{emoji} {label}{started_note}")
-
-        content = (
-            f"Available slots for **{date_str}**:\n" + "\n".join(lines) +
-            f"\n\nReact with the emoji to book (costs 1 token — you have {balance})."
+        await interaction.followup.send(
+            f"✅ Booked! {start_dt.strftime('%A, %B %-d')} from {label} (Eastern). "
+            f"Your voice channel will appear automatically when the session starts, "
+            f"and close automatically when it ends."
         )
-
-        message = await interaction.followup.send(content, wait=True)
-
-        for emoji in emoji_map:
-            try:
-                await message.add_reaction(emoji)
-            except discord.HTTPException:
-                pass
-
-        pending_book_prompts[message.id] = {
-            "user_id": interaction.user.id,
-            "date_str": date_str,
-            "options": options,
-            "emoji_map": emoji_map,
-        }
     except Exception as e:
         print(f"[book] unexpected error for user {interaction.user.id}: {e}")
         try:
@@ -574,158 +559,6 @@ async def book(interaction: discord.Interaction, date: str):
             )
         except discord.HTTPException:
             pass
-
-@client.event
-async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    if payload.guild_id is None or payload.user_id == client.user.id:
-        return
-
-    prompt = pending_book_prompts.get(payload.message_id)
-    if prompt is None or payload.user_id != prompt["user_id"]:
-        return
-
-    key = prompt["emoji_map"].get(str(payload.emoji))
-    if key is None:
-        return
-
-    option = next((o for o in prompt["options"] if o[0] == key), None)
-    if option is None:
-        return
-
-    # Claim the prompt right now, before any awaits — this is the only
-    # point where another near-simultaneous reaction could interleave, so
-    # popping here (synchronously) guarantees only the very first valid
-    # reaction can ever proceed. Any later reaction on this message,
-    # whatever emoji, finds nothing and is ignored.
-    pending_book_prompts.pop(payload.message_id, None)
-
-    channel = client.get_channel(payload.channel_id)
-    if channel is None:
-        return
-
-    try:
-        message = await channel.fetch_message(payload.message_id)
-    except discord.HTTPException:
-        message = None
-
-    _, label, start_dt, end_dt = option
-    now = datetime.datetime.now(TZ)
-    user_id = str(payload.user_id)
-
-    if end_dt <= now:
-        result_text = f"⛔ <@{payload.user_id}> that slot already ended. This prompt is now closed."
-    else:
-        with db_lock:
-            balance = get_balance(user_id)
-            if balance < 1:
-                result_text = (
-                    f"⛔ <@{payload.user_id}> you don't have any tokens. "
-                    f"Redeem a code first with /redeem. This prompt is now closed."
-                )
-            else:
-                dupe = conn.execute(
-                    "SELECT id FROM bookings WHERE discord_user_id = ? AND booking_date = ? AND slot = ? AND status != 'cancelled'",
-                    (user_id, prompt["date_str"], key),
-                ).fetchone()
-                if dupe:
-                    result_text = (
-                        f"⛔ <@{payload.user_id}> you've already booked that slot. This prompt is now closed."
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE balances SET tokens = tokens - 1 WHERE discord_user_id = ?", (user_id,)
-                    )
-                    conn.execute(
-                        "INSERT INTO bookings (discord_user_id, booking_date, slot, start_ts, end_ts, status) "
-                        "VALUES (?, ?, ?, ?, ?, 'booked')",
-                        (user_id, prompt["date_str"], key, start_dt.isoformat(), end_dt.isoformat()),
-                    )
-                    conn.commit()
-
-                    joined_late = start_dt <= now
-                    timing_note = (
-                        "The slot already started, so your channel will appear within a minute "
-                        "and still end at the scheduled time — no extra time for joining late."
-                        if joined_late else
-                        "Your voice channel will appear automatically when the slot starts, "
-                        "and close automatically when it ends."
-                    )
-                    result_text = (
-                        f"✅ <@{payload.user_id}> booked {label} on {prompt['date_str']} (Eastern). {timing_note}"
-                    )
-
-    # Whatever happened, this prompt is done: lock the message down so it
-    # can't be reacted to again for a different time.
-    if message is not None:
-        try:
-            await message.edit(content=result_text)
-            await message.clear_reactions()
-        except discord.HTTPException:
-            await channel.send(result_text)
-    else:
-        await channel.send(result_text)
-
-@client.tree.command(
-    name="listslots",
-    description="Show the current bookable time slots",
-    guild=discord.Object(id=GUILD_ID),
-)
-async def listslots(interaction: discord.Interaction):
-    slots = get_slots()
-    if not slots:
-        await reply(interaction, "No slots are configured.", ephemeral=True)
-        return
-    text = "\n".join(f"  {key} — {label}" for key, (_, _, label) in sorted(slots.items()))
-    await reply(interaction, f"Current slots:\n{text}", ephemeral=True)
-
-@client.tree.command(
-    name="addslot",
-    description="[Admin] Add or update a bookable time slot",
-    guild=discord.Object(id=GUILD_ID),
-)
-@app_commands.describe(
-    key="Short identifier, e.g. '9-12'",
-    start_hour="Start hour, 24h format, e.g. 9",
-    end_hour="End hour, 24h format, e.g. 12",
-    label="Display label, e.g. '9am - 12pm'",
-)
-async def addslot(interaction: discord.Interaction, key: str, start_hour: int, end_hour: int, label: str):
-    if not is_admin(interaction):
-        await admin_reply(interaction, "Admins only.", ephemeral=True)
-        return
-    if not (0 <= start_hour < 24 and 0 < end_hour <= 24 and start_hour < end_hour):
-        await admin_reply(interaction, "Hours must be 0-24 and start before end.", ephemeral=True)
-        return
-
-    with db_lock:
-        conn.execute(
-            "INSERT INTO slot_definitions (slot_key, start_hour, end_hour, label) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(slot_key) DO UPDATE SET start_hour = ?, end_hour = ?, label = ?",
-            (key, start_hour, end_hour, label, start_hour, end_hour, label),
-        )
-        conn.commit()
-
-    await admin_reply(interaction, f"Slot '{key}' set to {label}.", ephemeral=True)
-
-@client.tree.command(
-    name="removeslot",
-    description="[Admin] Remove a bookable time slot",
-    guild=discord.Object(id=GUILD_ID),
-)
-@app_commands.describe(key="The slot identifier to remove, e.g. '9-12'")
-async def removeslot(interaction: discord.Interaction, key: str):
-    if not is_admin(interaction):
-        await admin_reply(interaction, "Admins only.", ephemeral=True)
-        return
-
-    with db_lock:
-        cur = conn.execute("DELETE FROM slot_definitions WHERE slot_key = ?", (key,))
-        conn.commit()
-
-    if cur.rowcount == 0:
-        await admin_reply(interaction, f"No slot found with key '{key}'.", ephemeral=True)
-    else:
-        await admin_reply(interaction, f"Slot '{key}' removed.", ephemeral=True)
 
 @client.tree.command(
     name="createcode",
