@@ -4,3 +4,5 @@ python-dotenv
 requests
 tzdata
 openpyxl
+google-api-python-client
+google-auth
