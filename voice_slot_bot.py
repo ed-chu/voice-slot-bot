@@ -36,6 +36,7 @@ import secrets
 import sqlite3
 import threading
 import datetime
+import asyncio
 import smtplib
 from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
@@ -46,6 +47,8 @@ from discord.ext import tasks
 from flask import Flask, request, abort
 from dotenv import load_dotenv
 from openpyxl import Workbook
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 
 load_dotenv()
 
@@ -57,6 +60,12 @@ GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 TOKEN_PRODUCT_ID = os.environ["TOKEN_PRODUCT_ID"]
 TUTOR_ROLE_ID = int(os.environ["TUTOR_ROLE_ID"])
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
+GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
+GOOGLE_TEMPLATE_SHEET_ID = os.environ.get("GOOGLE_TEMPLATE_SHEET_ID", "1LiKujXIT7FIkcYmOnrfsEySq96tzg84IoYwWceLFpRo")
+GOOGLE_PARENT_FOLDER_ID = os.environ.get("GOOGLE_PARENT_FOLDER_ID")
+GOOGLE_SHEETS_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN and GOOGLE_PARENT_FOLDER_ID)
 
 TZ = ZoneInfo("America/Toronto")
 
@@ -131,6 +140,20 @@ def db_conn():
             discord_user_id TEXT PRIMARY KEY,
             category_id TEXT,
             text_channel_id TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS student_emails (
+            discord_user_id TEXT PRIMARY KEY,
+            email TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS student_sheets (
+            discord_user_id TEXT PRIMARY KEY,
+            folder_id TEXT,
+            spreadsheet_id TEXT,
+            spreadsheet_url TEXT
         )
     """)
     conn.commit()
@@ -327,6 +350,102 @@ async def ensure_student_channels(guild: discord.Guild, member: discord.Member):
     )
 
     return category, text_channel
+
+# ---------------------------------------------------------------------------
+# Google Sheets: per-student study log, created from a template on their
+# first check-in. Runs the (blocking) Google API calls in a thread executor
+# so it doesn't freeze the bot's event loop.
+# ---------------------------------------------------------------------------
+
+def get_student_email(discord_user_id: str):
+    row = conn.execute(
+        "SELECT email FROM student_emails WHERE discord_user_id = ?", (discord_user_id,)
+    ).fetchone()
+    if row and row[0]:
+        return row[0]
+    # Fall back to the email from their most recent redeemed Shopify code —
+    # may belong to a parent/payer rather than the student, so /setemail
+    # should be preferred when the student has their own Google account.
+    row = conn.execute(
+        "SELECT customer_email FROM codes WHERE redeemed_by = ? ORDER BY redeemed_at DESC LIMIT 1",
+        (discord_user_id,),
+    ).fetchone()
+    return row[0] if row and row[0] and row[0] != "unknown" else None
+
+def _get_drive_service():
+    creds = Credentials(
+        None,
+        refresh_token=GOOGLE_REFRESH_TOKEN,
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        token_uri="https://oauth2.googleapis.com/token",
+    )
+    return build("drive", "v3", credentials=creds)
+
+def _create_student_sheet_sync(student_name: str, student_email):
+    """Blocking Google API work: create a subfolder, copy the template sheet
+    into it, and share the subfolder with the student. Must be called via
+    run_in_executor, never awaited directly."""
+    drive = _get_drive_service()
+
+    folder = drive.files().create(
+        body={
+            "name": student_name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [GOOGLE_PARENT_FOLDER_ID],
+        },
+        fields="id",
+    ).execute()
+    folder_id = folder["id"]
+
+    sheet = drive.files().copy(
+        fileId=GOOGLE_TEMPLATE_SHEET_ID,
+        body={"name": f"{student_name} - Study Log", "parents": [folder_id]},
+        fields="id, webViewLink",
+    ).execute()
+
+    if student_email:
+        drive.permissions().create(
+            fileId=folder_id,
+            body={"type": "user", "role": "writer", "emailAddress": student_email},
+            sendNotificationEmail=False,
+        ).execute()
+
+    return folder_id, sheet["id"], sheet.get("webViewLink")
+
+async def ensure_student_sheet(member: discord.Member):
+    """Returns the study log URL, creating it on first call for this
+    student. Returns None if Google Sheets isn't configured or creation
+    fails — callers should treat that as 'skip this, not fatal'."""
+    if not GOOGLE_SHEETS_ENABLED:
+        return None
+
+    user_id = str(member.id)
+    row = conn.execute(
+        "SELECT spreadsheet_url FROM student_sheets WHERE discord_user_id = ?", (user_id,)
+    ).fetchone()
+    if row:
+        return row[0]
+
+    email = get_student_email(user_id)
+    loop = asyncio.get_event_loop()
+    try:
+        folder_id, sheet_id, url = await loop.run_in_executor(
+            None, _create_student_sheet_sync, member.display_name, email
+        )
+    except Exception as e:
+        print(f"[sheets] failed to create study log for {user_id}: {e}")
+        return None
+
+    with db_lock:
+        conn.execute(
+            "INSERT INTO student_sheets (discord_user_id, folder_id, spreadsheet_id, spreadsheet_url) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, folder_id, sheet_id, url),
+        )
+        conn.commit()
+
+    return url
 
 def is_admin(interaction: discord.Interaction) -> bool:
     return interaction.user.guild_permissions.administrator
@@ -854,6 +973,34 @@ async def checkbalance(interaction: discord.Interaction):
         f"Your token balance: {balance}", ephemeral=True
     )
 
+@client.tree.command(
+    name="setemail",
+    description="Set the Google account email your study log should be shared with",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(email="The Gmail/Google account email you use")
+async def setemail(interaction: discord.Interaction, email: str):
+    if "@" not in email or "." not in email:
+        await reply(interaction, "That doesn't look like a valid email address.", ephemeral=True)
+        return
+
+    user_id = str(interaction.user.id)
+    with db_lock:
+        conn.execute(
+            "INSERT INTO student_emails (discord_user_id, email) VALUES (?, ?) "
+            "ON CONFLICT(discord_user_id) DO UPDATE SET email = ?",
+            (user_id, email, email),
+        )
+        conn.commit()
+
+    await reply(
+        interaction,
+        f"Email set to {email}. If your study log hasn't been created yet, it'll be shared with this "
+        f"address automatically at your next check-in. If it already exists, ask a tutor to share it "
+        f"with you directly in Google Drive.",
+        ephemeral=True,
+    )
+
 # ---------------------------------------------------------------------------
 # Scheduler: create channels when slots start, delete when they end
 # ---------------------------------------------------------------------------
@@ -895,6 +1042,10 @@ async def create_voice_room_for_booking(guild: discord.Guild, member: discord.Me
     )
 
     await text_channel.send(checkin_message)
+
+    sheet_url = await ensure_student_sheet(member)
+    if sheet_url:
+        await text_channel.send(f"📊 Your study log: {sheet_url}")
 
     return voice_channel
 
