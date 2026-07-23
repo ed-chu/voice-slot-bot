@@ -344,10 +344,29 @@ async def ensure_student_channels(guild: discord.Guild, member: discord.Member):
         )
         conn.commit()
 
-    await text_channel.send(
-        f"{member.mention} welcome! This is your private space — only you and tutors can see it. "
-        f"Use this channel for commands and questions."
+    welcome_message = (
+        f"👋 **Welcome, {member.mention}!**\n\n"
+        f"This is your private space — only you and your tutors can see it. All your sessions, "
+        f"bookings, and your study log will happen here.\n\n"
+        f"**How it works:**\n"
+        f"1️⃣ After you purchase tokens, you'll get code(s) by email.\n"
+        f"2️⃣ Redeem a code here with `/redeem code:YOUR_CODE` — this adds tokens to your balance.\n"
+        f"3️⃣ Book a {SESSION_HOURS}-hour session with `/book date:07-15 time:2pm` (any date/time, "
+        f"at least {MIN_ADVANCE_HOURS} hours in advance).\n"
+        f"4️⃣ You'll get a reminder 3 minutes before your session starts, and check-in instructions "
+        f"right when it begins — a private voice room appears automatically.\n"
+        f"5️⃣ About 5 minutes before your session ends, you'll get a check-out reminder with a quick "
+        f"feedback form.\n\n"
+        f"**Common commands:**\n"
+        f"`/redeem code:XXXX` — add tokens to your balance\n"
+        f"`/checkbalance` — see how many tokens you have\n"
+        f"`/book date:MM-DD time:H:MMam/pm` — book a session\n"
+        f"`/mybookings` — see your upcoming sessions and balance\n"
+        f"`/setemail email:you@example.com` — link your Google account so your study log gets shared with you\n\n"
+        f"If anything isn't working, just ask here — a tutor can see this channel and help directly."
     )
+
+    await text_channel.send(welcome_message)
 
     return category, text_channel
 
